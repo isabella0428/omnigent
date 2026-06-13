@@ -36,8 +36,13 @@ _BLOCK_START_RE = re.compile(r"^#\s*///\s*script\s*$")
 # Matches the closing marker: ``# ///``
 _BLOCK_END_RE = re.compile(r"^#\s*///\s*$")
 # Matches a dependencies line: ``# dependencies = [...]``
+# ``re.MULTILINE`` is required because the pattern is anchored with ``^`` but
+# searched against the block's lines joined with ``\n``; PEP 723 imposes no
+# field ordering, so ``dependencies`` may appear on any line of the block
+# (e.g. after ``requires-python``), not just the first.
 _DEPS_RE = re.compile(
     r"^#\s*dependencies\s*=\s*\[([^\]]*)\]",
+    re.MULTILINE,
 )
 
 

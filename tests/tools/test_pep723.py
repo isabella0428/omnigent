@@ -77,3 +77,45 @@ def test_parse_block_without_dependencies_key() -> None:
 # ///
 """
     assert parse_inline_metadata(source) is None
+
+
+def test_parse_dependencies_after_requires_python() -> None:
+    """
+    PEP 723 imposes no field ordering, so ``dependencies`` is parsed
+    even when it is not the first line of the block (e.g. when
+    ``requires-python`` precedes it, as in the spec's own examples).
+    """
+    source = """\
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["requests>=2.28", "beautifulsoup4"]
+# ///
+
+SCHEMA = {}
+async def run(args):
+    return "ok"
+"""
+    result = parse_inline_metadata(source)
+    assert result is not None
+    assert result == InlineMetadata(
+        dependencies=["requests>=2.28", "beautifulsoup4"],
+    )
+
+
+def test_parse_multiline_dependencies_after_requires_python() -> None:
+    """
+    A multi-line ``dependencies`` array that follows ``requires-python``
+    (the canonical PEP 723 layout) is parsed correctly.
+    """
+    source = """\
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "requests<3",
+#   "rich",
+# ]
+# ///
+"""
+    result = parse_inline_metadata(source)
+    assert result is not None
+    assert result.dependencies == ["requests<3", "rich"]
