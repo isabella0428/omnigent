@@ -277,6 +277,7 @@ async def test_wait_for_terminal_times_out(monkeypatch: pytest.MonkeyPatch) -> N
     with pytest.raises(click.ClickException):
         await on._wait_for_opencode_terminal_ready(object(), "conv_1", timeout_s=0)  # type: ignore[arg-type]
 
+
 # --- Resume workspace alignment (launch.json record + cwd realign) ---
 def test_record_launch_for_fresh_session_persists_current_cwd(
     monkeypatch: pytest.MonkeyPatch,

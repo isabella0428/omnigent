@@ -518,7 +518,9 @@ def _prompt_opencode_resume_workspace_action(
     click.echo(f"\nSession was started in: {recorded_path}", err=True)
     click.echo(f"Current working directory: {current}", err=True)
     click.echo("OpenCode resume is workspace-scoped. Choose an action:", err=True)
-    click.echo(f"  {_RESUME_ACTION_SWITCH:<6} - Switch working directory to {recorded_path}", err=True)
+    click.echo(
+        f"  {_RESUME_ACTION_SWITCH:<6} - Switch working directory to {recorded_path}", err=True
+    )
     click.echo(f"  {_RESUME_ACTION_CANCEL:<6} - Cancel resume", err=True)
     return click.prompt(
         "Resume action",
