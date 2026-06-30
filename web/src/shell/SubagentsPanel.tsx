@@ -206,12 +206,6 @@ function childStatus(child: ChildSessionInfo): AgentStatus {
 }
 
 // Ordering priority for sibling agents in the rail; lower sorts first.
-// The rail's job is to surface what needs the user *now*, so agents
-// parked on a prompt ("awaiting") lead, then live work
-// ("working"/"launching"), then quiet ("idle"/"other"), with settled
-// rows ("done"/"failed") sinking to the bottom — otherwise active
-// agents get buried among finished ones (#1410). The done-vs-failed
-// order is deliberate but minor; flip if failures should read louder.
 const ACTIVITY_SORT_RANK: Record<AgentActivity, number> = {
   awaiting: 0,
   working: 1,
@@ -224,16 +218,16 @@ const ACTIVITY_SORT_RANK: Record<AgentActivity, number> = {
 
 /**
  * Order a sibling list of child sessions so attention-needing and live
- * agents rise above settled (done/failed) ones, without disturbing the
- * relative order of equal-status rows.
+ * agents rise above settled (done/failed) ones.
  *
- * The sort is stable by original index: every list re-polls on
- * ``TREE_POLL_MS``, so a non-deterministic tiebreak would make
- * same-status rows visibly reshuffle on each refresh. Returns a new
- * array; the input is not mutated.
+ * Within one activity, ties break by ``created_at`` descending (newest
+ * child first), with the original index as a final fallback. Both keys
+ * are immutable, so the order is fully deterministic and never
+ * reshuffles on a ``TREE_POLL_MS`` re-poll. Returns a new array; the
+ * input is not mutated.
  *
  * @param children - One sibling group (the root's direct children, or
- *   any row's grandchildren) in the server's original order.
+ *   any row's grandchildren).
  * @returns A new, priority-ordered array of the same children.
  */
 export function sortSiblingsByActivity(children: ChildSessionInfo[]): ChildSessionInfo[] {
@@ -243,7 +237,12 @@ export function sortSiblingsByActivity(children: ChildSessionInfo[]): ChildSessi
       index,
       rank: ACTIVITY_SORT_RANK[childStatus(child).activity],
     }))
-    .sort((a, b) => a.rank - b.rank || a.index - b.index)
+    .sort(
+      (a, b) =>
+        a.rank - b.rank ||
+        (b.child.created_at ?? 0) - (a.child.created_at ?? 0) ||
+        a.index - b.index,
+    )
     .map((entry) => entry.child);
 }
 
