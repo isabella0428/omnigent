@@ -132,7 +132,7 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
       </button>
       <ul className="flex min-h-0 flex-1 flex-col overflow-y-auto pb-1">
         <MainRow rootSessionId={rootSessionId} isActive={conversationId === rootSessionId} />
-        {children.map((child) => (
+        {sortSiblingsByActivity(children).map((child) => (
           <SubagentRow key={child.id} child={child} depth={1} conversationId={conversationId} />
         ))}
       </ul>
@@ -203,6 +203,48 @@ function childStatus(child: ChildSessionInfo): AgentStatus {
     return { activity: "other", label: child.current_task_status };
   }
   return { activity: "idle", label: "Idle" };
+}
+
+// Ordering priority for sibling agents in the rail; lower sorts first.
+// The rail's job is to surface what needs the user *now*, so agents
+// parked on a prompt ("awaiting") lead, then live work
+// ("working"/"launching"), then quiet ("idle"/"other"), with settled
+// rows ("done"/"failed") sinking to the bottom — otherwise active
+// agents get buried among finished ones (#1410). The done-vs-failed
+// order is deliberate but minor; flip if failures should read louder.
+const ACTIVITY_SORT_RANK: Record<AgentActivity, number> = {
+  awaiting: 0,
+  working: 1,
+  launching: 2,
+  idle: 3,
+  other: 4,
+  done: 5,
+  failed: 6,
+};
+
+/**
+ * Order a sibling list of child sessions so attention-needing and live
+ * agents rise above settled (done/failed) ones, without disturbing the
+ * relative order of equal-status rows.
+ *
+ * The sort is stable by original index: every list re-polls on
+ * ``TREE_POLL_MS``, so a non-deterministic tiebreak would make
+ * same-status rows visibly reshuffle on each refresh. Returns a new
+ * array; the input is not mutated.
+ *
+ * @param children - One sibling group (the root's direct children, or
+ *   any row's grandchildren) in the server's original order.
+ * @returns A new, priority-ordered array of the same children.
+ */
+export function sortSiblingsByActivity(children: ChildSessionInfo[]): ChildSessionInfo[] {
+  return children
+    .map((child, index) => ({
+      child,
+      index,
+      rank: ACTIVITY_SORT_RANK[childStatus(child).activity],
+    }))
+    .sort((a, b) => a.rank - b.rank || a.index - b.index)
+    .map((entry) => entry.child);
 }
 
 /**
@@ -623,7 +665,7 @@ function SubagentRow({
           )}
         </Link>
       </li>
-      {grandchildren.map((grandchild) => (
+      {sortSiblingsByActivity(grandchildren).map((grandchild) => (
         <SubagentRow
           key={grandchild.id}
           child={grandchild}
