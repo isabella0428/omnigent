@@ -26,8 +26,9 @@ and recency. Relevant wire events:
 Each turn is mirrored so the web chat matches the TUI: user/assistant text and
 tool calls are :class:`_MirrorItem`s POSTed as ``external_conversation_item`` /
 ``external_output_reasoning_delta``, and the turn is bracketed by ``running`` /
-``idle`` :class:`_StatusEdge`s (``external_session_status``). All of a turn's
-assistant-side items and its status edges share one ``response_id``
+``idle`` ``external_session_status`` edges (posted via :func:`_post_status_edge`,
+mirroring claude-native's item/status split — status is not a conversation item).
+All of a turn's assistant-side items and its status edges share one ``response_id``
 (``kimi:turn:<turnId>``) so the web renders in-flight tools as *live* cards
 (spinner + ticking timer) rather than static ones.
 
@@ -74,6 +75,13 @@ _STATUS_IDLE = "idle"
 #: steps follow" — the one non-terminal reason. Anything else (``end_turn`` …)
 #: ends the turn.
 _FINISH_TOOL_USE = "tool_use"
+
+#: A ``running`` / ``idle`` status edge to POST: ``(status, response_id)``.
+#: ``response_id`` names the turn on a ``running`` edge so the server records it
+#: as ``active_response_id`` — that is what keeps a mid-turn reconnect rendering
+#: the forwarded tool cards LIVE (the turn-start edge is not replayed on the SSE
+#: stream). Not modeled as a conversation item, mirroring claude-native.
+_StatusEdge = tuple[str, "str | None"]
 
 
 @dataclass
@@ -124,25 +132,6 @@ class _MirrorItem:
     name: str | None = None
     arguments: str | None = None
     output: str | None = None
-
-
-@dataclass
-class _StatusEdge:
-    """A session-status edge (``running`` / ``idle``) — not a conversation item.
-
-    ``response_id`` names the turn on a ``running`` edge; the server records it
-    as the session's ``active_response_id``, which is what keeps a mid-turn
-    reconnect rendering the forwarded tool cards LIVE (the turn-start edge is
-    not replayed on the SSE stream).
-    """
-
-    line_no: int
-    status: str
-    response_id: str | None = None
-
-
-#: Anything the planner asks the loop to POST.
-_Post = _MirrorItem | _StatusEdge
 
 
 def clear_kimi_bridge_state(bridge_dir: Path) -> None:
@@ -301,42 +290,48 @@ def _tool_output_text(result: object) -> str:
     return ""
 
 
-def _plan_row(
-    line_no: int, row: dict[str, object], state: _TurnState
-) -> tuple[list[_Post], _TurnState]:
-    """Translate one wire row into ``_MirrorItem`` / ``_StatusEdge`` posts.
+def _idle_edge(state: _TurnState) -> _StatusEdge:
+    """The ``idle`` edge closing the active turn (id names the released turn)."""
+    rid = _turn_response_id(state.turn_id) if state.turn_id is not None else None
+    return (_STATUS_IDLE, rid)
 
-    Pure: returns the posts to emit and the NEXT turn state. The caller commits
-    the returned state only after the posts land, so a POST failure that retries
-    the row cannot lose a ``running`` edge or double-advance the turn.
+
+def _row_to_item(
+    line_no: int, row: dict[str, object], state: _TurnState
+) -> tuple[list[_MirrorItem], _StatusEdge | None, _TurnState]:
+    """Translate one wire row into ``(items, status_edge, next_state)``.
+
+    Pure: any given row yields *either* conversation items *or* a status edge
+    (never both). The caller commits the returned state only after the posts
+    land, so a POST failure that retries the row cannot lose a ``running`` edge
+    or double-advance the turn.
     """
     row_type = row.get("type")
 
     if row_type == "turn.prompt":
         origin = row.get("origin")
         if isinstance(origin, dict) and origin.get("kind") != "user":
-            return [], state
+            return [], None, state
         text = _input_text(row.get("input"))
         if not text:
-            return [], state
+            return [], None, state
         # The user bubble keeps its own per-line id: turn.prompt carries no
         # turnId, and the message need not join the turn's response group — it
         # only has to precede the assistant items, which wire order guarantees.
         item = _MirrorItem(line_no, "message", f"kimi:turn:{line_no}", role="user", text=text)
-        return [item], state
+        return [item], None, state
 
     if row_type == "turn.cancel":
         if state.running:
-            rid = _turn_response_id(state.turn_id) if state.turn_id is not None else None
-            return [_StatusEdge(line_no, _STATUS_IDLE, rid)], _TurnState()
-        return [], state
+            return [], _idle_edge(state), _TurnState()
+        return [], None, state
 
     if row_type != "context.append_loop_event":
-        return [], state
+        return [], None, state
 
     event = row.get("event")
     if not isinstance(event, dict):
-        return [], state
+        return [], None, state
     etype = event.get("type")
 
     # Any event carrying turnId (re-)establishes the active turn — this also
@@ -347,65 +342,62 @@ def _plan_row(
 
     if etype == "step.begin":
         if state.turn_id is not None and not state.running:
-            edge = _StatusEdge(line_no, _STATUS_RUNNING, _turn_response_id(state.turn_id))
-            return [edge], replace(state, running=True)
-        return [], state
+            edge = (_STATUS_RUNNING, _turn_response_id(state.turn_id))
+            return [], edge, replace(state, running=True)
+        return [], None, state
 
     if etype == "step.end":
         if event.get("finishReason") == _FINISH_TOOL_USE:
-            return [], state  # paused for a tool; the turn continues
-        posts: list[_Post] = []
-        if state.running:
-            rid = _turn_response_id(state.turn_id) if state.turn_id is not None else None
-            posts = [_StatusEdge(line_no, _STATUS_IDLE, rid)]
-        return posts, _TurnState()
+            return [], None, state  # paused for a tool; the turn continues
+        edge = _idle_edge(state) if state.running else None
+        return [], edge, _TurnState()
 
     if etype == "content.part":
         part = event.get("part")
         if not isinstance(part, dict):
-            return [], state
+            return [], None, state
         part_type = part.get("type")
         if part_type == "text":
             text = part.get("text")
             if not isinstance(text, str) or not text:
-                return [], state
+                return [], None, state
             rid = _response_id(state, event, line_no)
             item = _MirrorItem(line_no, "message", rid, role="assistant", text=text)
-            return [item], state
+            return [item], None, state
         if part_type == "think":
             # Reasoning lives in ``part["think"]`` (not ``part["text"]``); mirror
             # it as a transient reasoning delta so the web UI paints a thinking
             # block — the kimi analogue of codex-native's #1254 reasoning fix.
             think = part.get("think")
             if not isinstance(think, str) or not think:
-                return [], state
+                return [], None, state
             rid = _response_id(state, event, line_no)
-            return [_MirrorItem(line_no, "reasoning", rid, text=think)], state
-        return [], state
+            return [_MirrorItem(line_no, "reasoning", rid, text=think)], None, state
+        return [], None, state
 
     if etype == "tool.call":
         call_id = event.get("toolCallId") or event.get("uuid")
         name = event.get("name")
         if not isinstance(call_id, str) or not isinstance(name, str):
-            return [], state
+            return [], None, state
         args = event.get("args")
         arguments = json.dumps(args if isinstance(args, dict) else {}, ensure_ascii=True)
         rid = _response_id(state, event, line_no)
         item = _MirrorItem(
             line_no, "function_call", rid, call_id=call_id, name=name, arguments=arguments
         )
-        return [item], state
+        return [item], None, state
 
     if etype == "tool.result":
         call_id = event.get("toolCallId") or event.get("parentUuid")
         if not isinstance(call_id, str):
-            return [], state
+            return [], None, state
         output = _tool_output_text(event.get("result"))
         rid = _response_id(state, event, line_no)
         item = _MirrorItem(line_no, "function_call_output", rid, call_id=call_id, output=output)
-        return [item], state
+        return [item], None, state
 
-    return [], state
+    return [], None, state
 
 
 def _read_new_rows(wire_path: Path, last_line: int) -> list[tuple[int, dict[str, object]]]:
@@ -462,11 +454,11 @@ def _conversation_item_data(item: _MirrorItem, agent_name: str) -> dict[str, obj
     return {"item_type": "message", "item_data": item_data, "response_id": item.response_id}
 
 
-def _status_edge_data(edge: _StatusEdge) -> dict[str, object]:
+def _status_edge_data(status: str, response_id: str | None) -> dict[str, object]:
     """Build the ``external_session_status`` ``data`` for one edge."""
-    data: dict[str, object] = {"status": edge.status}
-    if edge.response_id is not None:
-        data["response_id"] = edge.response_id
+    data: dict[str, object] = {"status": status}
+    if response_id is not None:
+        data["response_id"] = response_id
     return data
 
 
@@ -512,41 +504,49 @@ async def _post_status_edge(
     base_url: str,
     headers: dict[str, str],
     session_id: str,
-    edge: _StatusEdge,
+    status: str,
+    response_id: str | None,
 ) -> None:
     """POST one ``running`` / ``idle`` session-status edge."""
-    body = {"type": _EXTERNAL_STATUS, "data": _status_edge_data(edge)}
+    body = {"type": _EXTERNAL_STATUS, "data": _status_edge_data(status, response_id)}
     url = f"{base_url.rstrip('/')}/v1/sessions/{session_id}/events"
     resp = await client.post(url, headers=headers, json=body)
     resp.raise_for_status()
 
 
-async def _deliver_post(
+async def _deliver_row(
     client: httpx.AsyncClient,
     *,
     base_url: str,
     headers: dict[str, str],
     session_id: str,
-    post: _Post,
+    items: list[_MirrorItem],
+    status: _StatusEdge | None,
     agent_name: str,
 ) -> None:
-    """Dispatch one planned post to the right ``/events`` helper."""
-    if isinstance(post, _StatusEdge):
+    """POST one row's items (then its status edge, if any) to ``/events``."""
+    for item in items:
+        if item.kind == "reasoning":
+            await _post_reasoning_item(
+                client, base_url=base_url, headers=headers, session_id=session_id, item=item
+            )
+        else:
+            await _post_conversation_item(
+                client,
+                base_url=base_url,
+                headers=headers,
+                session_id=session_id,
+                item=item,
+                agent_name=agent_name,
+            )
+    if status is not None:
         await _post_status_edge(
-            client, base_url=base_url, headers=headers, session_id=session_id, edge=post
-        )
-    elif post.kind == "reasoning":
-        await _post_reasoning_item(
-            client, base_url=base_url, headers=headers, session_id=session_id, item=post
-        )
-    else:
-        await _post_conversation_item(
             client,
             base_url=base_url,
             headers=headers,
             session_id=session_id,
-            item=post,
-            agent_name=agent_name,
+            status=status[0],
+            response_id=status[1],
         )
 
 
@@ -564,9 +564,9 @@ async def forward_kimi_wire_to_session(
     """Poll the kimi session wire log and mirror new turns into the chat.
 
     Runs until cancelled. Discovers the wire log lazily (kimi writes it after the
-    first turn), then tails it, planning each new row into ``_MirrorItem`` /
-    ``_StatusEdge`` posts and persisting the line offset after every processed
-    row.
+    first turn), then tails it, translating each new row into conversation items
+    and ``running`` / ``idle`` status edges and persisting the line offset after
+    every processed row.
     """
     state = _read_state(bridge_dir)
     wire_path = Path(state.wire_path) if state is not None else None
@@ -586,26 +586,22 @@ async def forward_kimi_wire_to_session(
             if wire_path is not None and wire_path.exists():
                 rows = await asyncio.to_thread(_read_new_rows, wire_path, last_line)
                 for line_no, row in rows:
-                    posts, next_turn = _plan_row(line_no, row, turn)
-                    delivered = True
-                    for post in posts:
-                        try:
-                            await _deliver_post(
-                                client,
-                                base_url=base_url,
-                                headers=headers,
-                                session_id=session_id,
-                                post=post,
-                                agent_name=agent_name,
-                            )
-                        except httpx.HTTPError as exc:
-                            _logger.warning("kimi forwarder: POST failed (will retry): %s", exc)
-                            delivered = False
-                            break
-                    if not delivered:
+                    items, status, next_turn = _row_to_item(line_no, row, turn)
+                    try:
+                        await _deliver_row(
+                            client,
+                            base_url=base_url,
+                            headers=headers,
+                            session_id=session_id,
+                            items=items,
+                            status=status,
+                            agent_name=agent_name,
+                        )
+                    except httpx.HTTPError as exc:
+                        _logger.warning("kimi forwarder: POST failed (will retry): %s", exc)
                         break
                     # Commit turn state only after the row's posts land, so a
-                    # retried row re-plans against unchanged state.
+                    # retried row re-translates against unchanged state.
                     turn = next_turn
                     last_line = line_no + 1
                     _write_state(bridge_dir, _ForwardState(str(wire_path), last_line))

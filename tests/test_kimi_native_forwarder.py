@@ -1,10 +1,10 @@
 """Unit tests for the kimi-native transcript forwarder.
 
-Covers the stateful row planner against kimi's real ``wire.jsonl`` event schema
-(turn.prompt, step.begin/end, content.part text/think, tool.call/tool.result,
-turn.cancel), the ``/events`` body shapes, the line-offset state round-trip, and
-workspace/recency session discovery. The live POST loop is exercised by the e2e
-gate, not here.
+Covers the stateful row translator against kimi's real ``wire.jsonl`` event
+schema (turn.prompt, step.begin/end, content.part text/think, tool.call/
+tool.result, turn.cancel), the ``/events`` body shapes, the line-offset state
+round-trip, and workspace/recency session discovery. The live POST loop is
+exercised by the e2e gate, not here.
 """
 
 from __future__ import annotations
@@ -17,11 +17,10 @@ from omnigent.kimi_native_forwarder import (
     _discover_wire,
     _ForwardState,
     _MirrorItem,
-    _plan_row,
     _read_new_rows,
     _read_state,
+    _row_to_item,
     _status_edge_data,
-    _StatusEdge,
     _TurnState,
     _write_state,
     clear_kimi_bridge_state,
@@ -80,15 +79,16 @@ def _user_prompt(text: str) -> dict[str, object]:
 
 
 def _plan(line_no: int, row: dict[str, object], state: _TurnState | None = None):
-    return _plan_row(line_no, row, state or _TurnState())
+    return _row_to_item(line_no, row, state or _TurnState())
 
 
-class TestPlanRowMessages:
+class TestRowToItemMessages:
     def test_user_prompt_keeps_own_line_id(self) -> None:
-        posts, state = _plan(4, _user_prompt("what is in this repo?"))
-        assert posts == [
+        items, status, state = _plan(4, _user_prompt("what is in this repo?"))
+        assert items == [
             _MirrorItem(4, "message", "kimi:turn:4", role="user", text="what is in this repo?")
         ]
+        assert status is None
         assert state == _TurnState()  # user prompt carries no turnId → no turn state
 
     def test_non_user_prompt_skipped(self) -> None:
@@ -97,21 +97,23 @@ class TestPlanRowMessages:
             "input": [{"type": "text", "text": "x"}],
             "origin": {"kind": "system"},
         }
-        assert _plan(0, row) == ([], _TurnState())
+        assert _plan(0, row) == ([], None, _TurnState())
 
     def test_assistant_text_uses_turn_id(self) -> None:
-        posts, state = _plan(30, _part("3", "text", "hello"), _TurnState("3", True))
-        assert posts == [_MirrorItem(30, "message", "kimi:turn:3", role="assistant", text="hello")]
+        items, status, state = _plan(30, _part("3", "text", "hello"), _TurnState("3", True))
+        assert items == [_MirrorItem(30, "message", "kimi:turn:3", role="assistant", text="hello")]
+        assert status is None
         assert state.turn_id == "3"
 
     def test_assistant_text_falls_back_to_uuid_without_turn(self) -> None:
         # A content.part with no turnId and no carried turn → per-event id.
-        posts, _ = _plan(9, _part(None, "text", "hi", uuid="67ce67f7"))
-        assert posts == [_MirrorItem(9, "message", "kimi:67ce67f7", role="assistant", text="hi")]
+        items, _, _ = _plan(9, _part(None, "text", "hi", uuid="67ce67f7"))
+        assert items == [_MirrorItem(9, "message", "kimi:67ce67f7", role="assistant", text="hi")]
 
     def test_think_part_becomes_reasoning(self) -> None:
-        posts, state = _plan(30, _think("3", "let me think"), _TurnState("3", True))
-        assert posts == [_MirrorItem(30, "reasoning", "kimi:turn:3", text="let me think")]
+        items, status, state = _plan(30, _think("3", "let me think"), _TurnState("3", True))
+        assert items == [_MirrorItem(30, "reasoning", "kimi:turn:3", text="let me think")]
+        assert status is None
         assert state.turn_id == "3"
 
     def test_noise_rows_skipped(self) -> None:
@@ -121,62 +123,67 @@ class TestPlanRowMessages:
             {"type": "llm.request"},
             {"type": "context.append_message", "message": {"role": "user", "content": []}},
         ):
-            assert _plan(0, row) == ([], _TurnState())
+            assert _plan(0, row) == ([], None, _TurnState())
 
 
-class TestPlanRowStatus:
+class TestRowToItemStatus:
     def test_step_begin_posts_running_with_id_once(self) -> None:
-        posts, state = _plan(28, _loop("step.begin", turnId="3", step=1))
-        assert posts == [_StatusEdge(28, "running", "kimi:turn:3")]
+        items, status, state = _plan(28, _loop("step.begin", turnId="3", step=1))
+        assert items == []
+        assert status == ("running", "kimi:turn:3")
         assert state == _TurnState(turn_id="3", running=True)
         # A second step.begin in the same turn does not re-post running.
-        posts2, state2 = _plan_row(35, _loop("step.begin", turnId="3", step=2), state)
-        assert posts2 == []
-        assert state2 == _TurnState(turn_id="3", running=True)
+        items2, status2, state2 = _row_to_item(35, _loop("step.begin", turnId="3", step=2), state)
+        assert (items2, status2, state2) == ([], None, _TurnState(turn_id="3", running=True))
 
     def test_step_end_tool_use_keeps_running(self) -> None:
         row = _loop("step.end", turnId="3", step=1, finishReason="tool_use")
-        posts, state = _plan_row(33, row, _TurnState("3", True))
-        assert posts == []
-        assert state == _TurnState(turn_id="3", running=True)
+        assert _row_to_item(33, row, _TurnState("3", True)) == (
+            [],
+            None,
+            _TurnState(turn_id="3", running=True),
+        )
 
     def test_step_end_end_turn_posts_idle_and_resets(self) -> None:
         row = _loop("step.end", turnId="3", step=2, finishReason="end_turn")
-        posts, state = _plan_row(38, row, _TurnState("3", True))
-        assert posts == [_StatusEdge(38, "idle", "kimi:turn:3")]
-        assert state == _TurnState()
+        assert _row_to_item(38, row, _TurnState("3", True)) == (
+            [],
+            ("idle", "kimi:turn:3"),
+            _TurnState(),
+        )
 
     def test_step_end_without_running_resets_silently(self) -> None:
         row = _loop("step.end", turnId="0", step=1, finishReason="end_turn")
-        posts, state = _plan_row(10, row, _TurnState("0", False))
-        assert posts == []
-        assert state == _TurnState()
+        assert _row_to_item(10, row, _TurnState("0", False)) == ([], None, _TurnState())
 
     def test_turn_cancel_posts_idle_when_running(self) -> None:
-        posts, state = _plan_row(18, {"type": "turn.cancel"}, _TurnState("1", True))
-        assert posts == [_StatusEdge(18, "idle", "kimi:turn:1")]
-        assert state == _TurnState()
+        assert _row_to_item(18, {"type": "turn.cancel"}, _TurnState("1", True)) == (
+            [],
+            ("idle", "kimi:turn:1"),
+            _TurnState(),
+        )
 
     def test_turn_cancel_noop_when_idle(self) -> None:
-        assert _plan(18, {"type": "turn.cancel"}) == ([], _TurnState())
+        assert _plan(18, {"type": "turn.cancel"}) == ([], None, _TurnState())
 
 
-class TestPlanRowTools:
+class TestRowToItemTools:
     def test_tool_call_becomes_function_call(self) -> None:
         row = _tool_call("3", "Agent:0", "Agent", {"q": "x"})
-        posts, state = _plan_row(31, row, _TurnState("3", True))
+        items, status, state = _row_to_item(31, row, _TurnState("3", True))
         args = json.dumps({"q": "x"}, ensure_ascii=True)
-        assert posts == [
+        assert items == [
             _MirrorItem(
                 31, "function_call", "kimi:turn:3", call_id="Agent:0", name="Agent", arguments=args
             )
         ]
+        assert status is None
         assert state.turn_id == "3"
 
     def test_tool_result_uses_carried_turn_id(self) -> None:
         # tool.result has no turnId; it must inherit the remembered turn.
-        posts, _ = _plan_row(32, _tool_result("Agent:0", "22:00"), _TurnState("3", True))
-        assert posts == [
+        items, _, _ = _row_to_item(32, _tool_result("Agent:0", "22:00"), _TurnState("3", True))
+        assert items == [
             _MirrorItem(
                 32, "function_call_output", "kimi:turn:3", call_id="Agent:0", output="22:00"
             )
@@ -203,25 +210,27 @@ _GOLDEN_TURN = [
 ]
 
 
-def _descriptor(post: object) -> str:
-    if isinstance(post, _StatusEdge):
-        return f"status:{post.status}"
-    assert isinstance(post, _MirrorItem)
-    return post.kind
-
-
 class TestGoldenTurn:
     def _replay(self):
+        """Replay the turn into a flat ``(kind, payload)`` sequence of posts."""
         state = _TurnState()
-        posts: list[object] = []
+        seq: list[tuple[str, object]] = []
         for line_no, row in _GOLDEN_TURN:
-            batch, state = _plan_row(line_no, row, state)
-            posts.extend(batch)
-        return posts, state
+            items, status, state = _row_to_item(line_no, row, state)
+            seq.extend(("item", it) for it in items)
+            if status is not None:
+                seq.append(("status", status))
+        return seq, state
 
     def test_emits_expected_sequence(self) -> None:
-        posts, state = self._replay()
-        assert [_descriptor(p) for p in posts] == [
+        seq, state = self._replay()
+        descriptors = []
+        for kind, payload in seq:
+            if kind == "status":
+                descriptors.append(f"status:{payload[0]}")
+            else:
+                descriptors.append(payload.kind)
+        assert descriptors == [
             "message",  # user prompt
             "status:running",
             "message",  # assistant narration
@@ -233,31 +242,35 @@ class TestGoldenTurn:
         assert state == _TurnState()  # turn fully released
 
     def test_assistant_side_shares_one_response_id(self) -> None:
-        posts, _ = self._replay()
+        seq, _ = self._replay()
         ids: set[str] = set()
-        for p in posts:
-            if (isinstance(p, _MirrorItem) and p.kind in ("function_call", "function_call_output")) or (isinstance(p, _MirrorItem) and p.role == "assistant") or (isinstance(p, _StatusEdge) and p.response_id):
-                ids.add(p.response_id)
+        for kind, payload in seq:
+            if kind == "status" and payload[1] is not None:
+                ids.add(payload[1])
+            elif kind == "item" and (
+                payload.kind in ("function_call", "function_call_output")
+                or payload.role == "assistant"
+            ):
+                ids.add(payload.response_id)
         assert ids == {"kimi:turn:3"}
 
     def test_tool_call_and_output_share_call_id(self) -> None:
-        posts, _ = self._replay()
-        call = next(p for p in posts if isinstance(p, _MirrorItem) and p.kind == "function_call")
-        out = next(
-            p for p in posts if isinstance(p, _MirrorItem) and p.kind == "function_call_output"
-        )
+        seq, _ = self._replay()
+        items = [p for k, p in seq if k == "item"]
+        call = next(i for i in items if i.kind == "function_call")
+        out = next(i for i in items if i.kind == "function_call_output")
         assert call.call_id == out.call_id == "Agent:0"
 
 
 class TestBodyData:
     def test_running_status_carries_response_id(self) -> None:
-        assert _status_edge_data(_StatusEdge(28, "running", "kimi:turn:3")) == {
+        assert _status_edge_data("running", "kimi:turn:3") == {
             "status": "running",
             "response_id": "kimi:turn:3",
         }
 
     def test_status_without_response_id_omits_it(self) -> None:
-        assert _status_edge_data(_StatusEdge(0, "idle", None)) == {"status": "idle"}
+        assert _status_edge_data("idle", None) == {"status": "idle"}
 
     def test_user_message_body(self) -> None:
         item = _MirrorItem(4, "message", "kimi:turn:4", role="user", text="hi")
