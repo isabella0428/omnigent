@@ -32,8 +32,28 @@ _AGENT = "kimi-native-ui"
 # --- wire-row builders (mirror the shapes seen in a real wire.jsonl) ---------
 
 
+<<<<<<< HEAD
 def _loop(etype: str, **fields: object) -> dict[str, object]:
     return {"type": "context.append_loop_event", "event": {"type": etype, **fields}}
+=======
+    def test_think_part_is_reasoning(self) -> None:
+        # Reasoning lives in part["think"] (not part["text"]) and is mirrored as a
+        # reasoning item, not skipped — the kimi analogue of codex-native #1254.
+        row = {
+            "type": "context.append_loop_event",
+            "event": {
+                "type": "content.part",
+                "uuid": "abc123",
+                "part": {"type": "think", "think": "Let me reason about this."},
+            },
+        }
+        item = _row_to_item(5, row)
+        assert item is not None
+        assert item.kind == "reasoning"
+        assert item.role == "assistant"
+        assert item.text == "Let me reason about this."
+        assert item.response_id == "kimi:abc123"
+>>>>>>> upstream/main
 
 
 def _part(turn_id: str | None, part_type: str, text: str, uuid: str = "u") -> dict[str, object]:

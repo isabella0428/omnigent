@@ -14,6 +14,7 @@ native harness points ``KIMI_CODE_HOME`` at ``<bridge_dir>/kimi-code-home`` whos
 sessions share the tree; we disambiguate by ``workDir`` (via ``session_index.jsonl``)
 and recency. Relevant wire events:
 
+<<<<<<< HEAD
 - ``turn.prompt`` (``origin.kind == "user"``) → a user message.
 - ``context.append_loop_event`` wraps the streamed turn. Its ``event.type`` is
   one of: ``step.begin`` / ``step.end`` (step boundaries, carrying ``turnId`` and
@@ -21,6 +22,15 @@ and recency. Relevant wire events:
   assistant message; ``think`` is reasoning and skipped), ``tool.call`` and
   ``tool.result`` (a built-in tool invocation and its output).
 - ``turn.cancel`` → the turn was interrupted.
+=======
+- ``{"type": "turn.prompt", "input": [{"type":"text","text":…}], "origin": {"kind":"user"}}``
+  → a user message.
+- ``{"type": "context.append_loop_event", "event": {"type": "content.part",
+  "part": {"type": "text", "text": …}, "uuid": …}}`` → an assistant message.
+  (``part.type == "think"`` is reasoning, mirrored as a transient
+  ``external_output_reasoning_delta`` from ``part["think"]``; ``tool.call`` /
+  ``tool.result`` events are still skipped — the embedded terminal shows them.)
+>>>>>>> upstream/main
 
 Each turn is mirrored so the web chat matches the TUI: user/assistant text as
 ``external_conversation_item`` messages, tool calls as ``function_call`` /
@@ -104,6 +114,9 @@ class _MessagePost:
     role: str
     text: str
     response_id: str
+    # "message" (a user/assistant turn → external_conversation_item) or
+    # "reasoning" (a think block → external_output_reasoning_delta).
+    kind: str = "message"
 
 
 @dataclass
@@ -258,6 +271,7 @@ def _input_text(blocks: object) -> str:
     return "".join(parts)
 
 
+<<<<<<< HEAD
 def _event_turn_id(event: dict[str, object]) -> str | None:
     """Return the event's ``turnId`` as a string, or ``None`` when absent."""
     turn_id = event.get("turnId")
@@ -265,6 +279,56 @@ def _event_turn_id(event: dict[str, object]) -> str | None:
         return turn_id
     if isinstance(turn_id, int):
         return str(turn_id)
+=======
+def _row_to_item(line_no: int, row: dict[str, object]) -> _MirrorItem | None:
+    """Map one wire-log row to a conversation item, or ``None`` to skip it."""
+    row_type = row.get("type")
+    if row_type == "turn.prompt":
+        origin = row.get("origin")
+        if isinstance(origin, dict) and origin.get("kind") != "user":
+            return None
+        text = _input_text(row.get("input"))
+        if not text:
+            return None
+        return _MirrorItem(
+            line_no=line_no,
+            role="user",
+            text=text,
+            response_id=f"kimi:turn:{line_no}",
+        )
+    if row_type == "context.append_loop_event":
+        event = row.get("event")
+        if not isinstance(event, dict) or event.get("type") != "content.part":
+            return None
+        part = event.get("part")
+        if not isinstance(part, dict):
+            return None
+        uuid = event.get("uuid")
+        response_id = f"kimi:{uuid}" if isinstance(uuid, str) and uuid else f"kimi:line:{line_no}"
+        part_type = part.get("type")
+        if part_type == "text":
+            text = part.get("text")
+            if not isinstance(text, str) or not text:
+                return None
+            return _MirrorItem(
+                line_no=line_no, role="assistant", text=text, response_id=response_id
+            )
+        if part_type == "think":
+            # Reasoning lives in ``part["think"]`` (not ``part["text"]``). Mirror it
+            # as a transient reasoning event so the web UI paints a thinking block —
+            # the kimi analogue of codex-native's #1254 reasoning fix.
+            think = part.get("think")
+            if not isinstance(think, str) or not think:
+                return None
+            return _MirrorItem(
+                line_no=line_no,
+                role="assistant",
+                text=think,
+                response_id=response_id,
+                kind="reasoning",
+            )
+        return None
+>>>>>>> upstream/main
     return None
 
 
@@ -473,6 +537,29 @@ async def _emit_post(
     resp.raise_for_status()
 
 
+async def _post_reasoning_item(
+    client: httpx.AsyncClient,
+    *,
+    base_url: str,
+    headers: dict[str, str],
+    session_id: str,
+    item: _MirrorItem,
+) -> None:
+    """POST one mirrored think block as a transient reasoning event.
+
+    Mirrors codex-native (#1254): a one-shot ``external_output_reasoning_delta``
+    with ``started: true`` opens a reasoning block in the web UI. Kimi persists
+    completed think parts (not streamed deltas), so one delta per part is correct.
+    """
+    body = {
+        "type": "external_output_reasoning_delta",
+        "data": {"delta": item.text, "started": True},
+    }
+    url = f"{base_url.rstrip('/')}/v1/sessions/{session_id}/events"
+    resp = await client.post(url, headers=headers, json=body)
+    resp.raise_for_status()
+
+
 async def forward_kimi_wire_to_session(
     *,
     base_url: str,
@@ -507,6 +594,7 @@ async def forward_kimi_wire_to_session(
                     turn = _TurnState()
                     _write_state(bridge_dir, _ForwardState(str(wire_path), last_line))
             if wire_path is not None and wire_path.exists():
+<<<<<<< HEAD
                 rows = await asyncio.to_thread(_read_new_rows, wire_path, last_line)
                 for line_no, row in rows:
                     posts, next_turn = _plan_row(line_no, row, turn)
@@ -514,10 +602,18 @@ async def forward_kimi_wire_to_session(
                     for post in posts:
                         try:
                             await _emit_post(
+=======
+                items = await asyncio.to_thread(_read_new_items, wire_path, last_line)
+                for item in items:
+                    try:
+                        if item.kind == "reasoning":
+                            await _post_reasoning_item(
+>>>>>>> upstream/main
                                 client,
                                 base_url=base_url,
                                 headers=headers,
                                 session_id=session_id,
+<<<<<<< HEAD
                                 post=post,
                                 agent_name=agent_name,
                             )
@@ -526,6 +622,21 @@ async def forward_kimi_wire_to_session(
                             delivered = False
                             break
                     if not delivered:
+=======
+                                item=item,
+                            )
+                        else:
+                            await _post_conversation_item(
+                                client,
+                                base_url=base_url,
+                                headers=headers,
+                                session_id=session_id,
+                                item=item,
+                                agent_name=agent_name,
+                            )
+                    except httpx.HTTPError as exc:
+                        _logger.warning("kimi forwarder: POST failed (will retry): %s", exc)
+>>>>>>> upstream/main
                         break
                     # Commit turn state only after the row's posts land, so a
                     # retried row re-plans against unchanged state.
