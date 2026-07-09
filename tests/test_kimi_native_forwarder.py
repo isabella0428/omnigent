@@ -1,9 +1,10 @@
 """Unit tests for the kimi-native transcript forwarder.
 
 Covers the stateful row planner against kimi's real ``wire.jsonl`` event schema
-(turn.prompt, step.begin/end, content.part, tool.call/tool.result, turn.cancel),
-the request-body shapes, the line-offset state round-trip, and workspace/recency
-session discovery. The live POST loop is exercised by the e2e gate, not here.
+(turn.prompt, step.begin/end, content.part text/think, tool.call/tool.result,
+turn.cancel), the request-body shapes, the line-offset state round-trip, and
+workspace/recency session discovery. The live POST loop is exercised by the e2e
+gate, not here.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from omnigent.kimi_native_forwarder import (
     _post_body,
     _read_new_rows,
     _read_state,
+    _ReasoningPost,
     _StatusPost,
     _TurnState,
     _write_state,
@@ -32,28 +34,8 @@ _AGENT = "kimi-native-ui"
 # --- wire-row builders (mirror the shapes seen in a real wire.jsonl) ---------
 
 
-<<<<<<< HEAD
 def _loop(etype: str, **fields: object) -> dict[str, object]:
     return {"type": "context.append_loop_event", "event": {"type": etype, **fields}}
-=======
-    def test_think_part_is_reasoning(self) -> None:
-        # Reasoning lives in part["think"] (not part["text"]) and is mirrored as a
-        # reasoning item, not skipped — the kimi analogue of codex-native #1254.
-        row = {
-            "type": "context.append_loop_event",
-            "event": {
-                "type": "content.part",
-                "uuid": "abc123",
-                "part": {"type": "think", "think": "Let me reason about this."},
-            },
-        }
-        item = _row_to_item(5, row)
-        assert item is not None
-        assert item.kind == "reasoning"
-        assert item.role == "assistant"
-        assert item.text == "Let me reason about this."
-        assert item.response_id == "kimi:abc123"
->>>>>>> upstream/main
 
 
 def _part(turn_id: str | None, part_type: str, text: str, uuid: str = "u") -> dict[str, object]:
@@ -61,6 +43,17 @@ def _part(turn_id: str | None, part_type: str, text: str, uuid: str = "u") -> di
         "type": "content.part",
         "uuid": uuid,
         "part": {"type": part_type, "text": text},
+    }
+    if turn_id is not None:
+        event["turnId"] = turn_id
+    return {"type": "context.append_loop_event", "event": event}
+
+
+def _think(turn_id: str | None, think: str, uuid: str = "u") -> dict[str, object]:
+    event: dict[str, object] = {
+        "type": "content.part",
+        "uuid": uuid,
+        "part": {"type": "think", "think": think},
     }
     if turn_id is not None:
         event["turnId"] = turn_id
@@ -116,8 +109,10 @@ class TestPlanRowMessages:
         posts, _ = _plan(9, _part(None, "text", "hi", uuid="67ce67f7"))
         assert posts == [_MessagePost(9, "assistant", "hi", "kimi:67ce67f7")]
 
-    def test_think_part_skipped(self) -> None:
-        assert _plan(5, _part("3", "think", "reasoning")) == ([], _TurnState(turn_id="3"))
+    def test_think_part_becomes_reasoning(self) -> None:
+        posts, state = _plan(30, _think("3", "let me think"), _TurnState("3", True))
+        assert posts == [_ReasoningPost(30, "let me think")]
+        assert state.turn_id == "3"
 
     def test_noise_rows_skipped(self) -> None:
         for row in (
@@ -256,6 +251,13 @@ class TestPostBody:
         body = _post_body(_StatusPost(0, "idle", None), _AGENT)
         assert body == {"type": "external_session_status", "data": {"status": "idle"}}
 
+    def test_reasoning_body(self) -> None:
+        body = _post_body(_ReasoningPost(30, "hmm"), _AGENT)
+        assert body == {
+            "type": "external_output_reasoning_delta",
+            "data": {"delta": "hmm", "started": True},
+        }
+
     def test_user_message_body(self) -> None:
         body = _post_body(_MessagePost(4, "user", "hi", "kimi:turn:4"), _AGENT)
         assert body["type"] == "external_conversation_item"
@@ -302,7 +304,7 @@ class TestReadNewRows:
         rows = [
             {"type": "metadata", "protocol_version": 1},
             _user_prompt("hi"),
-            _part("0", "think", "…"),
+            _think("0", "…"),
             _part("0", "text", "hello!"),
         ]
         p = tmp_path / "wire.jsonl"
