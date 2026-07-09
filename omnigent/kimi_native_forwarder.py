@@ -48,6 +48,7 @@ import json
 import logging
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import NamedTuple
 
 import httpx
 
@@ -132,6 +133,19 @@ class _MirrorItem:
     name: str | None = None
     arguments: str | None = None
     output: str | None = None
+
+
+class _WireLine(NamedTuple):
+    """One tailed wire-log line: its 0-based index and the parsed JSON object."""
+
+    line_no: int
+    row: dict[str, object]
+
+
+#: What ``_translate_row`` produces for one wire line: the conversation items to
+#: POST, an optional ``running`` / ``idle`` status edge, and the next turn state.
+#: A row yields items *or* a status, never both.
+_RowResult = tuple[list[_MirrorItem], "_StatusEdge | None", _TurnState]
 
 
 def clear_kimi_bridge_state(bridge_dir: Path) -> None:
@@ -296,9 +310,7 @@ def _idle_edge(state: _TurnState) -> _StatusEdge:
     return (_STATUS_IDLE, rid)
 
 
-def _row_to_item(
-    line_no: int, row: dict[str, object], state: _TurnState
-) -> tuple[list[_MirrorItem], _StatusEdge | None, _TurnState]:
+def _translate_row(line_no: int, row: dict[str, object], state: _TurnState) -> _RowResult:
     """Translate one wire row into ``(items, status_edge, next_state)``.
 
     Pure: any given row yields *either* conversation items *or* a status edge
@@ -372,7 +384,8 @@ def _row_to_item(
             if not isinstance(think, str) or not think:
                 return [], None, state
             rid = _response_id(state, event, line_no)
-            return [_MirrorItem(line_no, "reasoning", rid, text=think)], None, state
+            item = _MirrorItem(line_no, "reasoning", rid, role="assistant", text=think)
+            return [item], None, state
         return [], None, state
 
     if etype == "tool.call":
@@ -400,8 +413,8 @@ def _row_to_item(
     return [], None, state
 
 
-def _read_new_rows(wire_path: Path, last_line: int) -> list[tuple[int, dict[str, object]]]:
-    """Parse wire-log lines beyond *last_line* into ``(line_no, row)`` pairs.
+def _read_new_rows(wire_path: Path, last_line: int) -> list[_WireLine]:
+    """Parse wire-log lines beyond *last_line* into :class:`_WireLine`s.
 
     The wire log is append-only JSONL, so a line count is a stable high-water
     mark. Non-JSON / non-object lines are dropped (they carry no line number
@@ -411,7 +424,7 @@ def _read_new_rows(wire_path: Path, last_line: int) -> list[tuple[int, dict[str,
         lines = wire_path.read_text(encoding="utf-8").splitlines()
     except OSError:
         return []
-    rows: list[tuple[int, dict[str, object]]] = []
+    rows: list[_WireLine] = []
     for idx in range(last_line, len(lines)):
         line = lines[idx].strip()
         if not line or not line.startswith("{"):
@@ -421,7 +434,7 @@ def _read_new_rows(wire_path: Path, last_line: int) -> list[tuple[int, dict[str,
         except ValueError:
             continue
         if isinstance(row, dict):
-            rows.append((idx, row))
+            rows.append(_WireLine(idx, row))
     return rows
 
 
@@ -586,7 +599,7 @@ async def forward_kimi_wire_to_session(
             if wire_path is not None and wire_path.exists():
                 rows = await asyncio.to_thread(_read_new_rows, wire_path, last_line)
                 for line_no, row in rows:
-                    items, status, next_turn = _row_to_item(line_no, row, turn)
+                    items, status, next_turn = _translate_row(line_no, row, turn)
                     try:
                         await _deliver_row(
                             client,

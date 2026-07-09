@@ -19,8 +19,8 @@ from omnigent.kimi_native_forwarder import (
     _MirrorItem,
     _read_new_rows,
     _read_state,
-    _row_to_item,
     _status_edge_data,
+    _translate_row,
     _TurnState,
     _write_state,
     clear_kimi_bridge_state,
@@ -78,13 +78,13 @@ def _user_prompt(text: str) -> dict[str, object]:
     }
 
 
-def _plan(line_no: int, row: dict[str, object], state: _TurnState | None = None):
-    return _row_to_item(line_no, row, state or _TurnState())
+def _run(line_no: int, row: dict[str, object], state: _TurnState | None = None):
+    return _translate_row(line_no, row, state or _TurnState())
 
 
-class TestRowToItemMessages:
+class TestTranslateRowMessages:
     def test_user_prompt_keeps_own_line_id(self) -> None:
-        items, status, state = _plan(4, _user_prompt("what is in this repo?"))
+        items, status, state = _run(4, _user_prompt("what is in this repo?"))
         assert items == [
             _MirrorItem(4, "message", "kimi:turn:4", role="user", text="what is in this repo?")
         ]
@@ -97,22 +97,24 @@ class TestRowToItemMessages:
             "input": [{"type": "text", "text": "x"}],
             "origin": {"kind": "system"},
         }
-        assert _plan(0, row) == ([], None, _TurnState())
+        assert _run(0, row) == ([], None, _TurnState())
 
     def test_assistant_text_uses_turn_id(self) -> None:
-        items, status, state = _plan(30, _part("3", "text", "hello"), _TurnState("3", True))
+        items, status, state = _run(30, _part("3", "text", "hello"), _TurnState("3", True))
         assert items == [_MirrorItem(30, "message", "kimi:turn:3", role="assistant", text="hello")]
         assert status is None
         assert state.turn_id == "3"
 
     def test_assistant_text_falls_back_to_uuid_without_turn(self) -> None:
         # A content.part with no turnId and no carried turn → per-event id.
-        items, _, _ = _plan(9, _part(None, "text", "hi", uuid="67ce67f7"))
+        items, _, _ = _run(9, _part(None, "text", "hi", uuid="67ce67f7"))
         assert items == [_MirrorItem(9, "message", "kimi:67ce67f7", role="assistant", text="hi")]
 
     def test_think_part_becomes_reasoning(self) -> None:
-        items, status, state = _plan(30, _think("3", "let me think"), _TurnState("3", True))
-        assert items == [_MirrorItem(30, "reasoning", "kimi:turn:3", text="let me think")]
+        items, status, state = _run(30, _think("3", "let me think"), _TurnState("3", True))
+        assert items == [
+            _MirrorItem(30, "reasoning", "kimi:turn:3", role="assistant", text="let me think")
+        ]
         assert status is None
         assert state.turn_id == "3"
 
@@ -123,22 +125,23 @@ class TestRowToItemMessages:
             {"type": "llm.request"},
             {"type": "context.append_message", "message": {"role": "user", "content": []}},
         ):
-            assert _plan(0, row) == ([], None, _TurnState())
+            assert _run(0, row) == ([], None, _TurnState())
 
 
-class TestRowToItemStatus:
+class TestTranslateRowStatus:
     def test_step_begin_posts_running_with_id_once(self) -> None:
-        items, status, state = _plan(28, _loop("step.begin", turnId="3", step=1))
+        items, status, state = _run(28, _loop("step.begin", turnId="3", step=1))
         assert items == []
         assert status == ("running", "kimi:turn:3")
         assert state == _TurnState(turn_id="3", running=True)
         # A second step.begin in the same turn does not re-post running.
-        items2, status2, state2 = _row_to_item(35, _loop("step.begin", turnId="3", step=2), state)
+        again = _loop("step.begin", turnId="3", step=2)
+        items2, status2, state2 = _translate_row(35, again, state)
         assert (items2, status2, state2) == ([], None, _TurnState(turn_id="3", running=True))
 
     def test_step_end_tool_use_keeps_running(self) -> None:
         row = _loop("step.end", turnId="3", step=1, finishReason="tool_use")
-        assert _row_to_item(33, row, _TurnState("3", True)) == (
+        assert _translate_row(33, row, _TurnState("3", True)) == (
             [],
             None,
             _TurnState(turn_id="3", running=True),
@@ -146,7 +149,7 @@ class TestRowToItemStatus:
 
     def test_step_end_end_turn_posts_idle_and_resets(self) -> None:
         row = _loop("step.end", turnId="3", step=2, finishReason="end_turn")
-        assert _row_to_item(38, row, _TurnState("3", True)) == (
+        assert _translate_row(38, row, _TurnState("3", True)) == (
             [],
             ("idle", "kimi:turn:3"),
             _TurnState(),
@@ -154,23 +157,23 @@ class TestRowToItemStatus:
 
     def test_step_end_without_running_resets_silently(self) -> None:
         row = _loop("step.end", turnId="0", step=1, finishReason="end_turn")
-        assert _row_to_item(10, row, _TurnState("0", False)) == ([], None, _TurnState())
+        assert _translate_row(10, row, _TurnState("0", False)) == ([], None, _TurnState())
 
     def test_turn_cancel_posts_idle_when_running(self) -> None:
-        assert _row_to_item(18, {"type": "turn.cancel"}, _TurnState("1", True)) == (
+        assert _translate_row(18, {"type": "turn.cancel"}, _TurnState("1", True)) == (
             [],
             ("idle", "kimi:turn:1"),
             _TurnState(),
         )
 
     def test_turn_cancel_noop_when_idle(self) -> None:
-        assert _plan(18, {"type": "turn.cancel"}) == ([], None, _TurnState())
+        assert _run(18, {"type": "turn.cancel"}) == ([], None, _TurnState())
 
 
-class TestRowToItemTools:
+class TestTranslateRowTools:
     def test_tool_call_becomes_function_call(self) -> None:
         row = _tool_call("3", "Agent:0", "Agent", {"q": "x"})
-        items, status, state = _row_to_item(31, row, _TurnState("3", True))
+        items, status, state = _translate_row(31, row, _TurnState("3", True))
         args = json.dumps({"q": "x"}, ensure_ascii=True)
         assert items == [
             _MirrorItem(
@@ -182,7 +185,7 @@ class TestRowToItemTools:
 
     def test_tool_result_uses_carried_turn_id(self) -> None:
         # tool.result has no turnId; it must inherit the remembered turn.
-        items, _, _ = _row_to_item(32, _tool_result("Agent:0", "22:00"), _TurnState("3", True))
+        items, _, _ = _translate_row(32, _tool_result("Agent:0", "22:00"), _TurnState("3", True))
         assert items == [
             _MirrorItem(
                 32, "function_call_output", "kimi:turn:3", call_id="Agent:0", output="22:00"
@@ -216,7 +219,7 @@ class TestGoldenTurn:
         state = _TurnState()
         seq: list[tuple[str, object]] = []
         for line_no, row in _GOLDEN_TURN:
-            items, status, state = _row_to_item(line_no, row, state)
+            items, status, state = _translate_row(line_no, row, state)
             seq.extend(("item", it) for it in items)
             if status is not None:
                 seq.append(("status", status))
@@ -333,7 +336,7 @@ class TestReadNewRows:
 
     def test_returns_line_indexed_rows(self, tmp_path: Path) -> None:
         rows = _read_new_rows(self._wire(tmp_path), 0)
-        assert [(n, r["type"]) for n, r in rows] == [
+        assert [(w.line_no, w.row["type"]) for w in rows] == [
             (0, "metadata"),
             (1, "turn.prompt"),
             (2, "context.append_loop_event"),
@@ -342,7 +345,7 @@ class TestReadNewRows:
 
     def test_offset_skips_already_seen(self, tmp_path: Path) -> None:
         rows = _read_new_rows(self._wire(tmp_path), 2)
-        assert [n for n, _ in rows] == [2, 3]
+        assert [w.line_no for w in rows] == [2, 3]
 
     def test_missing_file_is_empty(self, tmp_path: Path) -> None:
         assert _read_new_rows(tmp_path / "nope.jsonl", 0) == []
