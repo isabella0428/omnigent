@@ -14,17 +14,27 @@ native harness points ``KIMI_CODE_HOME`` at ``<bridge_dir>/kimi-code-home`` whos
 sessions share the tree; we disambiguate by ``workDir`` (via ``session_index.jsonl``)
 and recency. Relevant wire events:
 
-- ``{"type": "turn.prompt", "input": [{"type":"text","text":…}], "origin": {"kind":"user"}}``
-  → a user message.
-- ``{"type": "context.append_loop_event", "event": {"type": "content.part",
-  "part": {"type": "text", "text": …}, "uuid": …}}`` → an assistant message.
-  (``part.type == "think"`` is reasoning and is skipped for v1; ``tool.call`` /
-  ``tool.result`` events are likewise skipped — the embedded terminal shows them.)
+- ``turn.prompt`` (``origin.kind == "user"``) → a user message.
+- ``context.append_loop_event`` wraps the streamed turn. Its ``event.type`` is
+  one of: ``step.begin`` / ``step.end`` (step boundaries, carrying ``turnId`` and
+  a terminal ``finishReason``), ``content.part`` (``part.type == "text"`` is an
+  assistant message; ``think`` is reasoning and skipped), ``tool.call`` and
+  ``tool.result`` (a built-in tool invocation and its output).
+- ``turn.cancel`` → the turn was interrupted.
 
-Each mirrored turn is POSTed as an ``external_conversation_item`` to
-``/v1/sessions/{id}/events`` (the same shape :mod:`omnigent.kimi_native_hook`
-uses for its read-only approval surface). A per-session line offset is persisted
-in ``<bridge_dir>/kimi_forwarder.json`` so restarts resume without double-posting.
+Each turn is mirrored so the web chat matches the TUI: user/assistant text as
+``external_conversation_item`` messages, tool calls as ``function_call`` /
+``function_call_output`` items, and ``external_session_status`` ``running`` /
+``idle`` edges bracketing the turn. All of a turn's assistant-side items and its
+status edges share one ``response_id`` (``kimi:turn:<turnId>``) so the web renders
+in-flight tools as *live* cards (spinner + ticking timer) rather than static ones.
+
+kimi's wire has no ``turn.end`` event, and ``tool.result`` carries no ``turnId``,
+so the forwarder is a *stateful* tailer: it remembers the active turn across
+lines (:class:`_TurnState`) and treats a ``step.end`` whose ``finishReason`` is
+not ``tool_use`` (or a ``turn.cancel``) as the turn's end. A per-session line
+offset is persisted in ``<bridge_dir>/kimi_forwarder.json`` so restarts resume
+without double-posting.
 """
 
 from __future__ import annotations
@@ -33,7 +43,7 @@ import asyncio
 import contextlib
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import httpx
@@ -50,6 +60,18 @@ _DISCOVER_SKEW_MS = 10_000
 _BACKOFF_INITIAL_S = 1.0
 _BACKOFF_MAX_S = 30.0
 
+#: Omnigent session-event types (must match the server ingestion route; shared
+#: with the codex-/opencode-native forwarders).
+_EXTERNAL_ITEM = "external_conversation_item"
+_EXTERNAL_STATUS = "external_session_status"
+_STATUS_RUNNING = "running"
+_STATUS_IDLE = "idle"
+
+#: kimi ``step.end.finishReason`` meaning "paused this step to run a tool, more
+#: steps follow" — the one non-terminal reason. Anything else (``end_turn`` …)
+#: ends the turn.
+_FINISH_TOOL_USE = "tool_use"
+
 
 @dataclass
 class _ForwardState:
@@ -60,13 +82,68 @@ class _ForwardState:
 
 
 @dataclass
-class _MirrorItem:
-    """One conversation item to POST, plus the line index it came from."""
+class _TurnState:
+    """In-memory turn tracking for the stateful tail.
+
+    kimi emits no ``turn.end`` event and its ``tool.result`` carries no
+    ``turnId``, so the active turn must be remembered across lines. ``turn_id``
+    is kimi's ``turnId`` for the live turn (e.g. ``"3"``); ``running`` records
+    whether a ``running`` status edge has already been posted for it, so it
+    fires once per turn rather than once per step.
+    """
+
+    turn_id: str | None = None
+    running: bool = False
+
+
+@dataclass
+class _MessagePost:
+    """A user/assistant chat bubble to mirror."""
 
     line_no: int
     role: str
     text: str
     response_id: str
+
+
+@dataclass
+class _FunctionCallPost:
+    """A tool invocation to mirror as a ``function_call`` item."""
+
+    line_no: int
+    call_id: str
+    name: str
+    arguments: str
+    response_id: str
+
+
+@dataclass
+class _FunctionOutputPost:
+    """A tool result to mirror as a ``function_call_output`` item."""
+
+    line_no: int
+    call_id: str
+    output: str
+    response_id: str
+
+
+@dataclass
+class _StatusPost:
+    """A session-status edge (``running`` / ``idle``).
+
+    ``response_id`` names the turn on a ``running`` edge; the server records it
+    as the session's ``active_response_id``, which is what keeps a mid-turn
+    reconnect rendering the forwarded tool cards LIVE (the turn-start edge is
+    not replayed on the SSE stream).
+    """
+
+    line_no: int
+    status: str
+    response_id: str | None = None
+
+
+#: Anything the planner asks the loop to POST.
+_Post = _MessagePost | _FunctionCallPost | _FunctionOutputPost | _StatusPost
 
 
 def clear_kimi_bridge_state(bridge_dir: Path) -> None:
@@ -181,49 +258,151 @@ def _input_text(blocks: object) -> str:
     return "".join(parts)
 
 
-def _row_to_item(line_no: int, row: dict[str, object]) -> _MirrorItem | None:
-    """Map one wire-log row to a conversation item, or ``None`` to skip it."""
-    row_type = row.get("type")
-    if row_type == "turn.prompt":
-        origin = row.get("origin")
-        if isinstance(origin, dict) and origin.get("kind") != "user":
-            return None
-        text = _input_text(row.get("input"))
-        if not text:
-            return None
-        return _MirrorItem(
-            line_no=line_no,
-            role="user",
-            text=text,
-            response_id=f"kimi:turn:{line_no}",
-        )
-    if row_type == "context.append_loop_event":
-        event = row.get("event")
-        if not isinstance(event, dict) or event.get("type") != "content.part":
-            return None
-        part = event.get("part")
-        if not isinstance(part, dict) or part.get("type") != "text":
-            return None
-        text = part.get("text")
-        if not isinstance(text, str) or not text:
-            return None
-        uuid = event.get("uuid")
-        response_id = f"kimi:{uuid}" if isinstance(uuid, str) and uuid else f"kimi:line:{line_no}"
-        return _MirrorItem(line_no=line_no, role="assistant", text=text, response_id=response_id)
+def _event_turn_id(event: dict[str, object]) -> str | None:
+    """Return the event's ``turnId`` as a string, or ``None`` when absent."""
+    turn_id = event.get("turnId")
+    if isinstance(turn_id, str) and turn_id:
+        return turn_id
+    if isinstance(turn_id, int):
+        return str(turn_id)
     return None
 
 
-def _read_new_items(wire_path: Path, last_line: int) -> list[_MirrorItem]:
-    """Parse wire-log lines beyond *last_line* into conversation items.
+def _turn_response_id(turn_id: str) -> str:
+    """The shared per-turn response id (groups a turn's items + status edges)."""
+    return f"kimi:turn:{turn_id}"
+
+
+def _response_id(state: _TurnState, event: dict[str, object], line_no: int) -> str:
+    """Per-turn response id, or a per-event fallback when no turn is known.
+
+    Assistant text and tool events group under ``kimi:turn:<turnId>`` so they
+    share the turn's ``running`` edge and render as one live response. A
+    ``tool.result`` has no ``turnId`` and leans on the remembered turn; if even
+    that is missing (e.g. a mid-turn restart resumed past ``step.begin``), fall
+    back to a per-event id so the item still posts, just ungrouped.
+    """
+    if state.turn_id is not None:
+        return _turn_response_id(state.turn_id)
+    uuid = event.get("uuid")
+    if isinstance(uuid, str) and uuid:
+        return f"kimi:{uuid}"
+    return f"kimi:line:{line_no}"
+
+
+def _tool_output_text(result: object) -> str:
+    """Extract the mirrored text from a ``tool.result`` ``result`` payload."""
+    if isinstance(result, str):
+        return result
+    if isinstance(result, dict):
+        output = result.get("output")
+        if isinstance(output, str):
+            return output
+        return json.dumps(result, ensure_ascii=True)
+    return ""
+
+
+def _plan_row(
+    line_no: int, row: dict[str, object], state: _TurnState
+) -> tuple[list[_Post], _TurnState]:
+    """Translate one wire row into Omnigent posts, threading turn state.
+
+    Pure: returns the posts to emit and the NEXT turn state. The caller commits
+    the returned state only after the posts land, so a POST failure that retries
+    the row cannot lose a ``running`` edge or double-advance the turn.
+    """
+    row_type = row.get("type")
+
+    if row_type == "turn.prompt":
+        origin = row.get("origin")
+        if isinstance(origin, dict) and origin.get("kind") != "user":
+            return [], state
+        text = _input_text(row.get("input"))
+        if not text:
+            return [], state
+        # The user bubble keeps its own per-line id: turn.prompt carries no
+        # turnId, and the message need not join the turn's response group — it
+        # only has to precede the assistant items, which wire order guarantees.
+        return [_MessagePost(line_no, "user", text, f"kimi:turn:{line_no}")], state
+
+    if row_type == "turn.cancel":
+        if state.running:
+            rid = _turn_response_id(state.turn_id) if state.turn_id is not None else None
+            return [_StatusPost(line_no, _STATUS_IDLE, rid)], _TurnState()
+        return [], state
+
+    if row_type != "context.append_loop_event":
+        return [], state
+
+    event = row.get("event")
+    if not isinstance(event, dict):
+        return [], state
+    etype = event.get("type")
+
+    # Any event carrying turnId (re-)establishes the active turn — this also
+    # recovers the turn after a mid-turn restart resumed past ``step.begin``.
+    turn_id = _event_turn_id(event)
+    if turn_id is not None:
+        state = replace(state, turn_id=turn_id)
+
+    if etype == "step.begin":
+        if state.turn_id is not None and not state.running:
+            edge = _StatusPost(line_no, _STATUS_RUNNING, _turn_response_id(state.turn_id))
+            return [edge], replace(state, running=True)
+        return [], state
+
+    if etype == "step.end":
+        if event.get("finishReason") == _FINISH_TOOL_USE:
+            return [], state  # paused for a tool; the turn continues
+        posts: list[_Post] = []
+        if state.running:
+            rid = _turn_response_id(state.turn_id) if state.turn_id is not None else None
+            posts = [_StatusPost(line_no, _STATUS_IDLE, rid)]
+        return posts, _TurnState()
+
+    if etype == "content.part":
+        part = event.get("part")
+        if not isinstance(part, dict) or part.get("type") != "text":
+            return [], state
+        text = part.get("text")
+        if not isinstance(text, str) or not text:
+            return [], state
+        rid = _response_id(state, event, line_no)
+        return [_MessagePost(line_no, "assistant", text, rid)], state
+
+    if etype == "tool.call":
+        call_id = event.get("toolCallId") or event.get("uuid")
+        name = event.get("name")
+        if not isinstance(call_id, str) or not isinstance(name, str):
+            return [], state
+        args = event.get("args")
+        arguments = json.dumps(args if isinstance(args, dict) else {}, ensure_ascii=True)
+        rid = _response_id(state, event, line_no)
+        return [_FunctionCallPost(line_no, call_id, name, arguments, rid)], state
+
+    if etype == "tool.result":
+        call_id = event.get("toolCallId") or event.get("parentUuid")
+        if not isinstance(call_id, str):
+            return [], state
+        output = _tool_output_text(event.get("result"))
+        rid = _response_id(state, event, line_no)
+        return [_FunctionOutputPost(line_no, call_id, output, rid)], state
+
+    return [], state
+
+
+def _read_new_rows(wire_path: Path, last_line: int) -> list[tuple[int, dict[str, object]]]:
+    """Parse wire-log lines beyond *last_line* into ``(line_no, row)`` pairs.
 
     The wire log is append-only JSONL, so a line count is a stable high-water
-    mark. Non-JSON / unrecognized lines advance the cursor without emitting.
+    mark. Non-JSON / non-object lines are dropped (they carry no line number
+    forward on their own — the cursor advances as later rows are processed).
     """
     try:
         lines = wire_path.read_text(encoding="utf-8").splitlines()
     except OSError:
         return []
-    items: list[_MirrorItem] = []
+    rows: list[tuple[int, dict[str, object]]] = []
     for idx in range(last_line, len(lines)):
         line = lines[idx].strip()
         if not line or not line.startswith("{"):
@@ -232,41 +411,65 @@ def _read_new_items(wire_path: Path, last_line: int) -> list[_MirrorItem]:
             row = json.loads(line)
         except ValueError:
             continue
-        if not isinstance(row, dict):
-            continue
-        item = _row_to_item(idx, row)
-        if item is not None:
-            items.append(item)
-    return items
+        if isinstance(row, dict):
+            rows.append((idx, row))
+    return rows
 
 
-async def _post_conversation_item(
+def _post_body(post: _Post, agent_name: str) -> dict[str, object]:
+    """Build the ``/events`` request body for one planned post."""
+    if isinstance(post, _StatusPost):
+        status_data: dict[str, object] = {"status": post.status}
+        if post.response_id is not None:
+            status_data["response_id"] = post.response_id
+        return {"type": _EXTERNAL_STATUS, "data": status_data}
+    if isinstance(post, _MessagePost):
+        content_type = "input_text" if post.role == "user" else "output_text"
+        item_data: dict[str, object] = {
+            "role": post.role,
+            "content": [{"type": content_type, "text": post.text}],
+        }
+        if post.role == "assistant":
+            item_data["agent"] = agent_name
+        data: dict[str, object] = {
+            "item_type": "message",
+            "item_data": item_data,
+            "response_id": post.response_id,
+        }
+        return {"type": _EXTERNAL_ITEM, "data": data}
+    if isinstance(post, _FunctionCallPost):
+        data = {
+            "item_type": "function_call",
+            "item_data": {
+                "agent": agent_name,
+                "name": post.name,
+                "arguments": post.arguments,
+                "call_id": post.call_id,
+            },
+            "response_id": post.response_id,
+        }
+        return {"type": _EXTERNAL_ITEM, "data": data}
+    # _FunctionOutputPost
+    data = {
+        "item_type": "function_call_output",
+        "item_data": {"call_id": post.call_id, "output": post.output},
+        "response_id": post.response_id,
+    }
+    return {"type": _EXTERNAL_ITEM, "data": data}
+
+
+async def _emit_post(
     client: httpx.AsyncClient,
     *,
     base_url: str,
     headers: dict[str, str],
     session_id: str,
-    item: _MirrorItem,
+    post: _Post,
     agent_name: str,
 ) -> None:
-    """POST one mirrored turn as an external conversation item."""
-    content_type = "input_text" if item.role == "user" else "output_text"
-    item_data: dict[str, object] = {
-        "role": item.role,
-        "content": [{"type": content_type, "text": item.text}],
-    }
-    if item.role == "assistant":
-        item_data["agent"] = agent_name
-    body = {
-        "type": "external_conversation_item",
-        "data": {
-            "item_type": "message",
-            "item_data": item_data,
-            "response_id": item.response_id,
-        },
-    }
+    """POST one planned event to the session's ``/events`` endpoint."""
     url = f"{base_url.rstrip('/')}/v1/sessions/{session_id}/events"
-    resp = await client.post(url, headers=headers, json=body)
+    resp = await client.post(url, headers=headers, json=_post_body(post, agent_name))
     resp.raise_for_status()
 
 
@@ -284,12 +487,14 @@ async def forward_kimi_wire_to_session(
     """Poll the kimi session wire log and mirror new turns into the chat.
 
     Runs until cancelled. Discovers the wire log lazily (kimi writes it after the
-    first turn), then tails it, POSTing each new user/assistant turn and
-    persisting the line offset after every post.
+    first turn), then tails it, planning each new row into user/assistant
+    messages, ``function_call`` items and ``running`` / ``idle`` status edges,
+    and persisting the line offset after every processed row.
     """
     state = _read_state(bridge_dir)
     wire_path = Path(state.wire_path) if state is not None else None
     last_line = state.last_line if state is not None else 0
+    turn = _TurnState()
     async with httpx.AsyncClient(timeout=15.0) as client:
         while True:
             if wire_path is None or not wire_path.exists():
@@ -299,23 +504,33 @@ async def forward_kimi_wire_to_session(
                 if discovered is not None and discovered != wire_path:
                     wire_path = discovered
                     last_line = 0
+                    turn = _TurnState()
                     _write_state(bridge_dir, _ForwardState(str(wire_path), last_line))
             if wire_path is not None and wire_path.exists():
-                items = await asyncio.to_thread(_read_new_items, wire_path, last_line)
-                for item in items:
-                    try:
-                        await _post_conversation_item(
-                            client,
-                            base_url=base_url,
-                            headers=headers,
-                            session_id=session_id,
-                            item=item,
-                            agent_name=agent_name,
-                        )
-                    except httpx.HTTPError as exc:
-                        _logger.warning("kimi forwarder: POST failed (will retry): %s", exc)
+                rows = await asyncio.to_thread(_read_new_rows, wire_path, last_line)
+                for line_no, row in rows:
+                    posts, next_turn = _plan_row(line_no, row, turn)
+                    delivered = True
+                    for post in posts:
+                        try:
+                            await _emit_post(
+                                client,
+                                base_url=base_url,
+                                headers=headers,
+                                session_id=session_id,
+                                post=post,
+                                agent_name=agent_name,
+                            )
+                        except httpx.HTTPError as exc:
+                            _logger.warning("kimi forwarder: POST failed (will retry): %s", exc)
+                            delivered = False
+                            break
+                    if not delivered:
                         break
-                    last_line = item.line_no + 1
+                    # Commit turn state only after the row's posts land, so a
+                    # retried row re-plans against unchanged state.
+                    turn = next_turn
+                    last_line = line_no + 1
                     _write_state(bridge_dir, _ForwardState(str(wire_path), last_line))
             await asyncio.sleep(_POLL_INTERVAL_S)
 
