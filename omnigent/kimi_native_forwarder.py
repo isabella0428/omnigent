@@ -23,11 +23,11 @@ and recency. Relevant wire events:
   ``tool.call`` and ``tool.result`` (a built-in tool invocation and its output).
 - ``turn.cancel`` → the turn was interrupted.
 
-Each turn is mirrored so the web chat matches the TUI: user/assistant text as
-``external_conversation_item`` messages, think blocks as reasoning deltas, tool
-calls as ``function_call`` / ``function_call_output`` items, and
-``external_session_status`` ``running`` / ``idle`` edges bracketing the turn. All
-of a turn's assistant-side items and its status edges share one ``response_id``
+Each turn is mirrored so the web chat matches the TUI: user/assistant text and
+tool calls are :class:`_MirrorItem`s POSTed as ``external_conversation_item`` /
+``external_output_reasoning_delta``, and the turn is bracketed by ``running`` /
+``idle`` :class:`_StatusEdge`s (``external_session_status``). All of a turn's
+assistant-side items and its status edges share one ``response_id``
 (``kimi:turn:<turnId>``) so the web renders in-flight tools as *live* cards
 (spinner + ticking timer) rather than static ones.
 
@@ -100,47 +100,35 @@ class _TurnState:
 
 
 @dataclass
-class _MessagePost:
-    """A user/assistant chat bubble to mirror."""
+class _MirrorItem:
+    """One conversation item to POST, plus the line index it came from.
+
+    ``kind`` selects the wire shape (all but ``reasoning`` post as
+    ``external_conversation_item``):
+
+    - ``message`` → user/assistant text (``role`` + ``text``)
+    - ``reasoning`` → a think block, posted as ``external_output_reasoning_delta``
+      from ``text``
+    - ``function_call`` → a tool invocation (``call_id`` + ``name`` + ``arguments``)
+    - ``function_call_output`` → its result (``call_id`` + ``output``)
+
+    Fields not relevant to a given ``kind`` stay ``None``.
+    """
 
     line_no: int
-    role: str
-    text: str
-    response_id: str
+    kind: str = "message"
+    response_id: str = ""
+    role: str | None = None
+    text: str | None = None
+    call_id: str | None = None
+    name: str | None = None
+    arguments: str | None = None
+    output: str | None = None
 
 
 @dataclass
-class _ReasoningPost:
-    """A think block to mirror as a transient ``external_output_reasoning_delta``."""
-
-    line_no: int
-    delta: str
-
-
-@dataclass
-class _FunctionCallPost:
-    """A tool invocation to mirror as a ``function_call`` item."""
-
-    line_no: int
-    call_id: str
-    name: str
-    arguments: str
-    response_id: str
-
-
-@dataclass
-class _FunctionOutputPost:
-    """A tool result to mirror as a ``function_call_output`` item."""
-
-    line_no: int
-    call_id: str
-    output: str
-    response_id: str
-
-
-@dataclass
-class _StatusPost:
-    """A session-status edge (``running`` / ``idle``).
+class _StatusEdge:
+    """A session-status edge (``running`` / ``idle``) — not a conversation item.
 
     ``response_id`` names the turn on a ``running`` edge; the server records it
     as the session's ``active_response_id``, which is what keeps a mid-turn
@@ -154,7 +142,7 @@ class _StatusPost:
 
 
 #: Anything the planner asks the loop to POST.
-_Post = _MessagePost | _ReasoningPost | _FunctionCallPost | _FunctionOutputPost | _StatusPost
+_Post = _MirrorItem | _StatusEdge
 
 
 def clear_kimi_bridge_state(bridge_dir: Path) -> None:
@@ -316,7 +304,7 @@ def _tool_output_text(result: object) -> str:
 def _plan_row(
     line_no: int, row: dict[str, object], state: _TurnState
 ) -> tuple[list[_Post], _TurnState]:
-    """Translate one wire row into Omnigent posts, threading turn state.
+    """Translate one wire row into ``_MirrorItem`` / ``_StatusEdge`` posts.
 
     Pure: returns the posts to emit and the NEXT turn state. The caller commits
     the returned state only after the posts land, so a POST failure that retries
@@ -334,12 +322,13 @@ def _plan_row(
         # The user bubble keeps its own per-line id: turn.prompt carries no
         # turnId, and the message need not join the turn's response group — it
         # only has to precede the assistant items, which wire order guarantees.
-        return [_MessagePost(line_no, "user", text, f"kimi:turn:{line_no}")], state
+        item = _MirrorItem(line_no, "message", f"kimi:turn:{line_no}", role="user", text=text)
+        return [item], state
 
     if row_type == "turn.cancel":
         if state.running:
             rid = _turn_response_id(state.turn_id) if state.turn_id is not None else None
-            return [_StatusPost(line_no, _STATUS_IDLE, rid)], _TurnState()
+            return [_StatusEdge(line_no, _STATUS_IDLE, rid)], _TurnState()
         return [], state
 
     if row_type != "context.append_loop_event":
@@ -358,7 +347,7 @@ def _plan_row(
 
     if etype == "step.begin":
         if state.turn_id is not None and not state.running:
-            edge = _StatusPost(line_no, _STATUS_RUNNING, _turn_response_id(state.turn_id))
+            edge = _StatusEdge(line_no, _STATUS_RUNNING, _turn_response_id(state.turn_id))
             return [edge], replace(state, running=True)
         return [], state
 
@@ -368,7 +357,7 @@ def _plan_row(
         posts: list[_Post] = []
         if state.running:
             rid = _turn_response_id(state.turn_id) if state.turn_id is not None else None
-            posts = [_StatusPost(line_no, _STATUS_IDLE, rid)]
+            posts = [_StatusEdge(line_no, _STATUS_IDLE, rid)]
         return posts, _TurnState()
 
     if etype == "content.part":
@@ -381,7 +370,8 @@ def _plan_row(
             if not isinstance(text, str) or not text:
                 return [], state
             rid = _response_id(state, event, line_no)
-            return [_MessagePost(line_no, "assistant", text, rid)], state
+            item = _MirrorItem(line_no, "message", rid, role="assistant", text=text)
+            return [item], state
         if part_type == "think":
             # Reasoning lives in ``part["think"]`` (not ``part["text"]``); mirror
             # it as a transient reasoning delta so the web UI paints a thinking
@@ -389,7 +379,8 @@ def _plan_row(
             think = part.get("think")
             if not isinstance(think, str) or not think:
                 return [], state
-            return [_ReasoningPost(line_no, think)], state
+            rid = _response_id(state, event, line_no)
+            return [_MirrorItem(line_no, "reasoning", rid, text=think)], state
         return [], state
 
     if etype == "tool.call":
@@ -400,7 +391,10 @@ def _plan_row(
         args = event.get("args")
         arguments = json.dumps(args if isinstance(args, dict) else {}, ensure_ascii=True)
         rid = _response_id(state, event, line_no)
-        return [_FunctionCallPost(line_no, call_id, name, arguments, rid)], state
+        item = _MirrorItem(
+            line_no, "function_call", rid, call_id=call_id, name=name, arguments=arguments
+        )
+        return [item], state
 
     if etype == "tool.result":
         call_id = event.get("toolCallId") or event.get("parentUuid")
@@ -408,7 +402,8 @@ def _plan_row(
             return [], state
         output = _tool_output_text(event.get("result"))
         rid = _response_id(state, event, line_no)
-        return [_FunctionOutputPost(line_no, call_id, output, rid)], state
+        item = _MirrorItem(line_no, "function_call_output", rid, call_id=call_id, output=output)
+        return [item], state
 
     return [], state
 
@@ -438,53 +433,95 @@ def _read_new_rows(wire_path: Path, last_line: int) -> list[tuple[int, dict[str,
     return rows
 
 
-def _post_body(post: _Post, agent_name: str) -> dict[str, object]:
-    """Build the ``/events`` request body for one planned post."""
-    if isinstance(post, _StatusPost):
-        status_data: dict[str, object] = {"status": post.status}
-        if post.response_id is not None:
-            status_data["response_id"] = post.response_id
-        return {"type": _EXTERNAL_STATUS, "data": status_data}
-    if isinstance(post, _ReasoningPost):
-        # One-shot delta with ``started`` opens a reasoning block. Kimi persists
-        # completed think parts (not streamed deltas), so one delta per part.
-        return {"type": _EXTERNAL_REASONING_DELTA, "data": {"delta": post.delta, "started": True}}
-    if isinstance(post, _MessagePost):
-        content_type = "input_text" if post.role == "user" else "output_text"
-        item_data: dict[str, object] = {
-            "role": post.role,
-            "content": [{"type": content_type, "text": post.text}],
-        }
-        if post.role == "assistant":
-            item_data["agent"] = agent_name
-        data: dict[str, object] = {
-            "item_type": "message",
-            "item_data": item_data,
-            "response_id": post.response_id,
-        }
-        return {"type": _EXTERNAL_ITEM, "data": data}
-    if isinstance(post, _FunctionCallPost):
-        data = {
+def _conversation_item_data(item: _MirrorItem, agent_name: str) -> dict[str, object]:
+    """Build the ``external_conversation_item`` ``data`` for one item."""
+    if item.kind == "function_call":
+        return {
             "item_type": "function_call",
             "item_data": {
                 "agent": agent_name,
-                "name": post.name,
-                "arguments": post.arguments,
-                "call_id": post.call_id,
+                "name": item.name,
+                "arguments": item.arguments,
+                "call_id": item.call_id,
             },
-            "response_id": post.response_id,
+            "response_id": item.response_id,
         }
-        return {"type": _EXTERNAL_ITEM, "data": data}
-    # _FunctionOutputPost
-    data = {
-        "item_type": "function_call_output",
-        "item_data": {"call_id": post.call_id, "output": post.output},
-        "response_id": post.response_id,
+    if item.kind == "function_call_output":
+        return {
+            "item_type": "function_call_output",
+            "item_data": {"call_id": item.call_id, "output": item.output},
+            "response_id": item.response_id,
+        }
+    content_type = "input_text" if item.role == "user" else "output_text"
+    item_data: dict[str, object] = {
+        "role": item.role,
+        "content": [{"type": content_type, "text": item.text}],
     }
-    return {"type": _EXTERNAL_ITEM, "data": data}
+    if item.role == "assistant":
+        item_data["agent"] = agent_name
+    return {"item_type": "message", "item_data": item_data, "response_id": item.response_id}
 
 
-async def _emit_post(
+def _status_edge_data(edge: _StatusEdge) -> dict[str, object]:
+    """Build the ``external_session_status`` ``data`` for one edge."""
+    data: dict[str, object] = {"status": edge.status}
+    if edge.response_id is not None:
+        data["response_id"] = edge.response_id
+    return data
+
+
+async def _post_conversation_item(
+    client: httpx.AsyncClient,
+    *,
+    base_url: str,
+    headers: dict[str, str],
+    session_id: str,
+    item: _MirrorItem,
+    agent_name: str,
+) -> None:
+    """POST one mirrored message / function-call item."""
+    body = {"type": _EXTERNAL_ITEM, "data": _conversation_item_data(item, agent_name)}
+    url = f"{base_url.rstrip('/')}/v1/sessions/{session_id}/events"
+    resp = await client.post(url, headers=headers, json=body)
+    resp.raise_for_status()
+
+
+async def _post_reasoning_item(
+    client: httpx.AsyncClient,
+    *,
+    base_url: str,
+    headers: dict[str, str],
+    session_id: str,
+    item: _MirrorItem,
+) -> None:
+    """POST one mirrored think block as a transient reasoning event.
+
+    A one-shot ``external_output_reasoning_delta`` with ``started: true`` opens a
+    reasoning block in the web UI. Kimi persists completed think parts (not
+    streamed deltas), so one delta per part is correct.
+    """
+    body = {"type": _EXTERNAL_REASONING_DELTA, "data": {"delta": item.text, "started": True}}
+    url = f"{base_url.rstrip('/')}/v1/sessions/{session_id}/events"
+    resp = await client.post(url, headers=headers, json=body)
+    resp.raise_for_status()
+
+
+async def _post_status_edge(
+    client: httpx.AsyncClient,
+    *,
+    base_url: str,
+    headers: dict[str, str],
+    session_id: str,
+    edge: _StatusEdge,
+) -> None:
+    """POST one ``running`` / ``idle`` session-status edge."""
+    body = {"type": _EXTERNAL_STATUS, "data": _status_edge_data(edge)}
+    url = f"{base_url.rstrip('/')}/v1/sessions/{session_id}/events"
+    resp = await client.post(url, headers=headers, json=body)
+    resp.raise_for_status()
+
+
+async def _deliver_post(
     client: httpx.AsyncClient,
     *,
     base_url: str,
@@ -493,10 +530,24 @@ async def _emit_post(
     post: _Post,
     agent_name: str,
 ) -> None:
-    """POST one planned event to the session's ``/events`` endpoint."""
-    url = f"{base_url.rstrip('/')}/v1/sessions/{session_id}/events"
-    resp = await client.post(url, headers=headers, json=_post_body(post, agent_name))
-    resp.raise_for_status()
+    """Dispatch one planned post to the right ``/events`` helper."""
+    if isinstance(post, _StatusEdge):
+        await _post_status_edge(
+            client, base_url=base_url, headers=headers, session_id=session_id, edge=post
+        )
+    elif post.kind == "reasoning":
+        await _post_reasoning_item(
+            client, base_url=base_url, headers=headers, session_id=session_id, item=post
+        )
+    else:
+        await _post_conversation_item(
+            client,
+            base_url=base_url,
+            headers=headers,
+            session_id=session_id,
+            item=post,
+            agent_name=agent_name,
+        )
 
 
 async def forward_kimi_wire_to_session(
@@ -513,9 +564,9 @@ async def forward_kimi_wire_to_session(
     """Poll the kimi session wire log and mirror new turns into the chat.
 
     Runs until cancelled. Discovers the wire log lazily (kimi writes it after the
-    first turn), then tails it, planning each new row into user/assistant
-    messages, reasoning deltas, ``function_call`` items and ``running`` / ``idle``
-    status edges, and persisting the line offset after every processed row.
+    first turn), then tails it, planning each new row into ``_MirrorItem`` /
+    ``_StatusEdge`` posts and persisting the line offset after every processed
+    row.
     """
     state = _read_state(bridge_dir)
     wire_path = Path(state.wire_path) if state is not None else None
@@ -539,7 +590,7 @@ async def forward_kimi_wire_to_session(
                     delivered = True
                     for post in posts:
                         try:
-                            await _emit_post(
+                            await _deliver_post(
                                 client,
                                 base_url=base_url,
                                 headers=headers,
