@@ -7,6 +7,7 @@ import {
   FileTypeIcon,
   FolderTreeIcon,
   ListIcon,
+  ListTreeIcon,
   SearchIcon,
   SlidersHorizontalIcon,
   XIcon,
@@ -31,11 +32,20 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { type ChangedSort, FlatFileList } from "./FlatFileList";
 import { FolderTree } from "./FolderTree";
+import { ChangedFileTree } from "./ChangedFileTree";
 
 interface FilesPanelProps {
   onFileSelect: (path: string) => void;
   flatView: boolean;
   onFlatViewChange: (flatView: boolean) => void;
+  /**
+   * Layout of the "Changed" scope: false = flat list, true = collapsible
+   * folder tree of the changed files. Lifted to the parent (persisted) so the
+   * choice survives inline→drawer transitions and page refreshes. Only affects
+   * the Changed scope — the "All" scope is always a tree.
+   */
+  changedTreeView: boolean;
+  onChangedTreeViewChange: (changedTreeView: boolean) => void;
   /**
    * Whether hidden files (dot-prefixed paths) are visible. Lifted to
    * the parent so the state survives inline→drawer transitions.
@@ -157,6 +167,44 @@ function SortSelector({
 }
 
 // ---------------------------------------------------------------------------
+// ChangedLayoutToggle — flat list ⇄ folder tree for the Changed scope. A
+// single toggle button (like the hidden-files / filters toggles): the icon
+// reflects the active layout and the label states the action. Only rendered in
+// the Changed scope, since the All scope is always a tree.
+// ---------------------------------------------------------------------------
+
+function ChangedLayoutToggle({
+  treeView,
+  onChange,
+}: {
+  treeView: boolean;
+  onChange: (treeView: boolean) => void;
+}) {
+  const action = treeView ? "Switch to list view" : "Switch to tree view";
+  return (
+    <TooltipProvider>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <button
+            type="button"
+            aria-label={action}
+            aria-pressed={treeView}
+            className={cn(
+              "flex shrink-0 cursor-pointer items-center rounded-full px-2.5 py-[4px] hover:bg-muted",
+              treeView ? "text-foreground" : "text-muted-foreground hover:text-foreground",
+            )}
+            onClick={() => onChange(!treeView)}
+          >
+            {treeView ? <ListTreeIcon className="size-3.5" /> : <ListIcon className="size-3.5" />}
+          </button>
+        </TooltipTrigger>
+        <TooltipContent side="bottom">{action}</TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // FileScopeSwitch — segmented Changed | All control that flips the whole Files
 // view between the changed-files-only flat list (Changed) and the full folder
 // tree (All). One control replaces the old separate Files / Changes rail tabs.
@@ -264,6 +312,8 @@ export function FilesPanel({
   onFileSelect,
   flatView,
   onFlatViewChange,
+  changedTreeView,
+  onChangedTreeViewChange,
   showHidden,
   onShowHiddenChange,
   sort: changedSort,
@@ -403,6 +453,7 @@ export function FilesPanel({
                 value={changedSearch}
               />
             </div>
+            <ChangedLayoutToggle treeView={changedTreeView} onChange={onChangedTreeViewChange} />
             <SortSelector sort={changedSort} onChange={onSortChange} />
           </div>
         </div>
@@ -470,19 +521,35 @@ export function FilesPanel({
         )}
       >
         {flatView ? (
-          <FlatFileList
-            files={changedQuery.data?.data}
-            isLoading={changedQuery.isLoading}
-            isError={changedQuery.isError}
-            error={changedQuery.error}
-            onFileSelect={onFileSelect}
-            showHidden={showHidden}
-            onShowHidden={() => onShowHiddenChange(true)}
-            searchQuery={changedSearch}
-            sort={changedSort}
-            conversationId={conversationId}
-            runnerWentOffline={runnerWentOffline}
-          />
+          changedTreeView ? (
+            <ChangedFileTree
+              files={changedQuery.data?.data}
+              isLoading={changedQuery.isLoading}
+              isError={changedQuery.isError}
+              error={changedQuery.error}
+              onFileSelect={onFileSelect}
+              showHidden={showHidden}
+              onShowHidden={() => onShowHiddenChange(true)}
+              searchQuery={changedSearch}
+              sort={changedSort}
+              conversationId={conversationId}
+              runnerWentOffline={runnerWentOffline}
+            />
+          ) : (
+            <FlatFileList
+              files={changedQuery.data?.data}
+              isLoading={changedQuery.isLoading}
+              isError={changedQuery.isError}
+              error={changedQuery.error}
+              onFileSelect={onFileSelect}
+              showHidden={showHidden}
+              onShowHidden={() => onShowHiddenChange(true)}
+              searchQuery={changedSearch}
+              sort={changedSort}
+              conversationId={conversationId}
+              runnerWentOffline={runnerWentOffline}
+            />
+          )
         ) : (
           <FolderTree
             files={allFilesQuery.data?.data}

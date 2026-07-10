@@ -105,6 +105,8 @@ function searchResult(files: WorkspaceFile[] | undefined = undefined, isFetching
 function renderPanel({
   conversationId,
   flatView = false,
+  changedTreeView = false,
+  onChangedTreeViewChange = vi.fn(),
   showHidden = false,
   files,
   changedFiles = [],
@@ -115,6 +117,8 @@ function renderPanel({
 }: {
   conversationId: string;
   flatView?: boolean;
+  changedTreeView?: boolean;
+  onChangedTreeViewChange?: (treeView: boolean) => void;
   showHidden?: boolean;
   files: WorkspaceFile[];
   changedFiles?: WorkspaceChangedFile[];
@@ -141,6 +145,8 @@ function renderPanel({
               flatView={flatView}
               onFileSelect={vi.fn()}
               onFlatViewChange={vi.fn()}
+              changedTreeView={changedTreeView}
+              onChangedTreeViewChange={onChangedTreeViewChange}
               showHidden={showHidden}
               onShowHiddenChange={vi.fn()}
               onClose={onClose}
@@ -236,6 +242,8 @@ describe("FilesPanel working folder header role", () => {
                 flatView={false}
                 onFileSelect={vi.fn()}
                 onFlatViewChange={vi.fn()}
+                changedTreeView={false}
+                onChangedTreeViewChange={vi.fn()}
                 showHidden={false}
                 onShowHiddenChange={vi.fn()}
               />
@@ -317,6 +325,8 @@ describe("FilesPanel scope switch (Changed | All) visibility", () => {
                 flatView={false}
                 onFileSelect={vi.fn()}
                 onFlatViewChange={vi.fn()}
+                changedTreeView={false}
+                onChangedTreeViewChange={vi.fn()}
                 showHidden={false}
                 onShowHiddenChange={vi.fn()}
               />
@@ -366,6 +376,8 @@ describe("FilesPanel scope switch (Changed | All) visibility", () => {
                 flatView={false}
                 onFileSelect={vi.fn()}
                 onFlatViewChange={onFlatViewChange}
+                changedTreeView={false}
+                onChangedTreeViewChange={vi.fn()}
                 showHidden={false}
                 onShowHiddenChange={vi.fn()}
               />
@@ -401,6 +413,8 @@ describe("FilesPanel changed files search", () => {
                 flatView={true}
                 onFileSelect={vi.fn()}
                 onFlatViewChange={vi.fn()}
+                changedTreeView={false}
+                onChangedTreeViewChange={vi.fn()}
                 showHidden={false}
                 onShowHiddenChange={vi.fn()}
               />
@@ -463,6 +477,8 @@ describe("FilesPanel changed files search", () => {
                 flatView={false}
                 onFileSelect={vi.fn()}
                 onFlatViewChange={vi.fn()}
+                changedTreeView={false}
+                onChangedTreeViewChange={vi.fn()}
                 showHidden={false}
                 onShowHiddenChange={vi.fn()}
               />
@@ -485,6 +501,8 @@ describe("FilesPanel changed files search", () => {
                 flatView={true}
                 onFileSelect={vi.fn()}
                 onFlatViewChange={vi.fn()}
+                changedTreeView={false}
+                onChangedTreeViewChange={vi.fn()}
                 showHidden={false}
                 onShowHiddenChange={vi.fn()}
               />
@@ -559,6 +577,8 @@ describe("FilesPanel changed files search", () => {
                     onFileSelect={vi.fn()}
                     flatView={false}
                     onFlatViewChange={vi.fn()}
+                    changedTreeView={false}
+                    onChangedTreeViewChange={vi.fn()}
                     showHidden={showHidden}
                     onShowHiddenChange={setShowHidden}
                   />
@@ -573,6 +593,8 @@ describe("FilesPanel changed files search", () => {
                         flatView={false}
                         onFileSelect={vi.fn()}
                         onFlatViewChange={vi.fn()}
+                        changedTreeView={false}
+                        onChangedTreeViewChange={vi.fn()}
                         showHidden={showHidden}
                         onShowHiddenChange={setShowHidden}
                       />
@@ -628,6 +650,8 @@ describe("FilesPanel changed files search", () => {
                     onFileSelect={vi.fn()}
                     flatView={false}
                     onFlatViewChange={vi.fn()}
+                    changedTreeView={false}
+                    onChangedTreeViewChange={vi.fn()}
                     showHidden={showHidden}
                     onShowHiddenChange={setShowHidden}
                   />
@@ -642,6 +666,8 @@ describe("FilesPanel changed files search", () => {
                         flatView={false}
                         onFileSelect={vi.fn()}
                         onFlatViewChange={vi.fn()}
+                        changedTreeView={false}
+                        onChangedTreeViewChange={vi.fn()}
                         showHidden={showHidden}
                         onShowHiddenChange={setShowHidden}
                       />
@@ -691,6 +717,8 @@ describe("FilesPanel changed files search", () => {
                   flatView={true}
                   onFileSelect={vi.fn()}
                   onFlatViewChange={vi.fn()}
+                  changedTreeView={false}
+                  onChangedTreeViewChange={vi.fn()}
                   showHidden={showHidden}
                   onShowHiddenChange={setShowHidden}
                 />
@@ -744,6 +772,8 @@ describe("FilesPanel tree (Explore) search", () => {
                 flatView={true}
                 onFileSelect={vi.fn()}
                 onFlatViewChange={vi.fn()}
+                changedTreeView={false}
+                onChangedTreeViewChange={vi.fn()}
                 showHidden={false}
                 onShowHiddenChange={vi.fn()}
               />
@@ -935,6 +965,8 @@ describe("FilesPanel tree (Explore) search", () => {
                 flatView={true}
                 onFileSelect={vi.fn()}
                 onFlatViewChange={vi.fn()}
+                changedTreeView={false}
+                onChangedTreeViewChange={vi.fn()}
                 showHidden={false}
                 onShowHiddenChange={vi.fn()}
               />
@@ -957,6 +989,8 @@ describe("FilesPanel tree (Explore) search", () => {
                 flatView={false}
                 onFileSelect={vi.fn()}
                 onFlatViewChange={vi.fn()}
+                changedTreeView={false}
+                onChangedTreeViewChange={vi.fn()}
                 showHidden={false}
                 onShowHiddenChange={vi.fn()}
               />
@@ -1165,6 +1199,8 @@ describe("FilesPanel tree (Explore) search", () => {
                 flatView={true}
                 onFileSelect={vi.fn()}
                 onFlatViewChange={vi.fn()}
+                changedTreeView={false}
+                onChangedTreeViewChange={vi.fn()}
                 showHidden={false}
                 onShowHiddenChange={vi.fn()}
               />
@@ -1188,6 +1224,8 @@ describe("FilesPanel tree (Explore) search", () => {
                 flatView={false}
                 onFileSelect={vi.fn()}
                 onFlatViewChange={vi.fn()}
+                changedTreeView={false}
+                onChangedTreeViewChange={vi.fn()}
                 showHidden={false}
                 onShowHiddenChange={vi.fn()}
               />
@@ -1212,5 +1250,73 @@ describe("FilesPanel sort control", () => {
       flatView: false,
     });
     expect(screen.getByRole("button", { name: /^Sort:/ })).toBeInTheDocument();
+  });
+});
+
+describe("FilesPanel changed list/tree layout toggle", () => {
+  it("offers the tree-view toggle in the Changed scope", () => {
+    renderPanel({
+      conversationId: "conv_toggle",
+      files: [],
+      flatView: true,
+      changedFiles: [changedFile("src/a.ts")],
+    });
+    expect(screen.getByRole("button", { name: "Switch to tree view" })).toBeInTheDocument();
+  });
+
+  it("does not show the layout toggle in the All scope", () => {
+    // The All scope is always a tree, so the list/tree toggle is meaningless
+    // there and must not render.
+    renderPanel({
+      conversationId: "conv_toggle_all",
+      files: [file("a.txt")],
+      flatView: false,
+    });
+    expect(screen.queryByRole("button", { name: /Switch to (tree|list) view/ })).toBeNull();
+  });
+
+  it("renders the changed files as a flat list by default", () => {
+    renderPanel({
+      conversationId: "conv_flat",
+      files: [],
+      flatView: true,
+      changedTreeView: false,
+      changedFiles: [changedFile("src/a.ts")],
+    });
+    // Flat list shows the full path; there's no folder row.
+    expect(screen.getByText("src/a.ts")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "src/" })).toBeNull();
+  });
+
+  it("renders the changed files as a folder tree when tree view is on", () => {
+    renderPanel({
+      conversationId: "conv_tree",
+      files: [],
+      flatView: true,
+      changedTreeView: true,
+      changedFiles: [changedFile("src/a.ts"), changedFile("src/nested/b.ts")],
+    });
+    expect(screen.getByRole("button", { name: "src/" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "nested/" })).toBeInTheDocument();
+    expect(screen.getByText("a.ts")).toBeInTheDocument();
+    // The toggle now reflects the active tree layout.
+    expect(screen.getByRole("button", { name: "Switch to list view" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+  });
+
+  it("invokes the change handler when the toggle is clicked", () => {
+    const onChangedTreeViewChange = vi.fn();
+    renderPanel({
+      conversationId: "conv_toggle_click",
+      files: [],
+      flatView: true,
+      changedTreeView: false,
+      onChangedTreeViewChange,
+      changedFiles: [changedFile("src/a.ts")],
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Switch to tree view" }));
+    expect(onChangedTreeViewChange).toHaveBeenCalledWith(true);
   });
 });

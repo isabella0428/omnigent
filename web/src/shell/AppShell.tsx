@@ -218,6 +218,12 @@ export function AppShell() {
   const [filesPanelSort, setFilesPanelSort] = useState<ChangedSort>(
     () => readFilesPanelPreferences().sort,
   );
+  // Changed-scope layout: false = flat list, true = collapsible folder tree.
+  // Seeded from the persisted preference; a manual toggle writes it back so the
+  // choice sticks across session switches and refreshes (like scope and sort).
+  const [filesPanelChangedTreeView, setFilesPanelChangedTreeView] = useState(
+    () => readFilesPanelPreferences().changedTreeView,
+  );
   const [panelInitialKey, setPanelInitialKeyState] = useState<string | null>(null);
   const [executionLogsKey, setExecutionLogsKey] = useState<string | null>(null);
   const [filesPanelOpen, setFilesPanelOpen] = useState(false);
@@ -797,6 +803,11 @@ export function AppShell() {
     writeFilesPanelPreferences({ ...readFilesPanelPreferences(), sort: s });
   }, []);
 
+  const handleFilesChangedTreeViewChange = useCallback((treeView: boolean) => {
+    setFilesPanelChangedTreeView(treeView);
+    writeFilesPanelPreferences({ ...readFilesPanelPreferences(), changedTreeView: treeView });
+  }, []);
+
   const openFileViewer = useCallback(
     (path: string) => {
       setSelectedFilePath(path);
@@ -1332,6 +1343,8 @@ export function AppShell() {
                       onSortChange={handleFilesSortChange}
                       filesPanelFlatView={filesPanelFlatView}
                       onFlatViewChange={handleFilesFlatViewChange}
+                      filesPanelChangedTreeView={filesPanelChangedTreeView}
+                      onChangedTreeViewChange={handleFilesChangedTreeViewChange}
                       filesPanelShowHidden={filesPanelShowHidden}
                       onShowHiddenChange={setFilesPanelShowHidden}
                     />
@@ -1370,6 +1383,8 @@ export function AppShell() {
                   onFileSelect={openFileViewer}
                   flatView={filesPanelFlatView}
                   onFlatViewChange={handleFilesFlatViewChange}
+                  changedTreeView={filesPanelChangedTreeView}
+                  onChangedTreeViewChange={handleFilesChangedTreeViewChange}
                   showHidden={filesPanelShowHidden}
                   onShowHiddenChange={setFilesPanelShowHidden}
                   sort={filesPanelSort}
