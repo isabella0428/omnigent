@@ -50,7 +50,10 @@ from urllib.parse import urlparse as _urlparse
 
 from omnigent.inner.native_attachments import parse_data_uri
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
-from omnigent.onboarding.databricks_config import DATABRICKS_CLAUDE_DEFAULT_MODEL
+from omnigent.onboarding.databricks_config import (
+    DATABRICKS_ANTHROPIC_MODELS,
+    DATABRICKS_CLAUDE_DEFAULT_MODEL,
+)
 from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
 from omnigent.spec.types import RetryPolicy
 
@@ -594,31 +597,9 @@ _DATABRICKS_RESPONSES_MODELS = [
     },
 ]
 
-_DATABRICKS_ANTHROPIC_MODELS = [
-    {
-        "id": "databricks-claude-opus-4-8",
-        "name": "Claude Opus 4.8",
-        # Gateway-verified caps: >1000000 input rejects, 128001+ output rejects.
-        "contextWindow": 1000000,
-        "maxTokens": 128000,
-        "input": ["text", "image"],
-    },
-    {
-        "id": "databricks-claude-sonnet-4-6",
-        "name": "Claude Sonnet 4.6",
-        "contextWindow": 1000000,
-        "maxTokens": 128000,
-        "input": ["text", "image"],
-    },
-    {
-        "id": "databricks-claude-sonnet-4-5",
-        "name": "Claude Sonnet 4.5",
-        # Gateway rejects this model past ~200k input.
-        "contextWindow": 200000,
-        "maxTokens": 16384,
-        "input": ["text", "image"],
-    },
-]
+# Claude endpoints (``DATABRICKS_ANTHROPIC_MODELS``, imported above) live in
+# ``onboarding.databricks_config`` so the interactive ``omnigent pi`` path shares
+# the same catalog this harness advertises.
 
 # Empty: the only listed endpoint (meta-llama-3.3-70b) no longer exists on
 # the gateway. The provider stays so non-Claude/GPT ids keep a routing home.
@@ -777,7 +758,7 @@ def _build_models_json(
                 "apiKey": token,
                 "api": "anthropic-messages",
                 "authHeader": True,
-                "models": _DATABRICKS_ANTHROPIC_MODELS,
+                "models": DATABRICKS_ANTHROPIC_MODELS,
             },
             # Everything else (Llama, etc.) → same endpoint, same API
             "databricks-completions": {

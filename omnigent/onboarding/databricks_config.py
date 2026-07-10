@@ -84,6 +84,42 @@ def databricks_sdk_installed() -> bool:
 # own ``opus[1m]`` default.
 DATABRICKS_CLAUDE_DEFAULT_MODEL = "databricks-claude-opus-4-8"
 
+# Known Claude endpoints on the Databricks AI gateway's Anthropic Messages
+# surface. Shared so every surface that renders a Pi ``models.json`` for that
+# gateway (the spawned harness in ``inner.pi_executor`` and the interactive
+# ``omnigent pi`` path in ``pi_native_credentials``) advertises the same set —
+# otherwise a picker built from one surface silently lists fewer models than
+# the gateway actually serves.
+#
+# Each entry declares ``input: ["text", "image"]``: Pi's transformMessages
+# strips image blocks unless the model entry advertises image input, so a
+# registered model missing this would silently drop attached images.
+DATABRICKS_ANTHROPIC_MODELS: list[dict[str, str | int | list[str]]] = [
+    {
+        "id": "databricks-claude-opus-4-8",
+        "name": "Claude Opus 4.8",
+        # Gateway-verified caps: >1000000 input rejects, 128001+ output rejects.
+        "contextWindow": 1000000,
+        "maxTokens": 128000,
+        "input": ["text", "image"],
+    },
+    {
+        "id": "databricks-claude-sonnet-4-6",
+        "name": "Claude Sonnet 4.6",
+        "contextWindow": 1000000,
+        "maxTokens": 128000,
+        "input": ["text", "image"],
+    },
+    {
+        "id": "databricks-claude-sonnet-4-5",
+        "name": "Claude Sonnet 4.5",
+        # Gateway rejects this model past ~200k input.
+        "contextWindow": 200000,
+        "maxTokens": 16384,
+        "input": ["text", "image"],
+    },
+]
+
 
 def list_databricks_profiles() -> list[str]:
     """Return the profile section names declared in ``~/.databrickscfg``.

@@ -47,6 +47,32 @@ def test_resolves_databricks_default_to_anthropic_gateway(monkeypatch: pytest.Mo
     assert "demo-staging" in provider.api_key
 
 
+def test_databricks_default_lists_full_model_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression: Pi's ``/model`` must list every gateway Claude model.
+
+    Previously the rendered ``models.json`` carried only the launch default
+    (``databricks-claude-sonnet-4-6``), so ``omnigent pi`` → ``/model`` offered
+    a single choice and manual entry of another id was rejected. The resolver
+    now advertises the full Databricks Anthropic catalog.
+    """
+    from omnigent.inner import databricks_executor
+    from omnigent.onboarding.databricks_config import DATABRICKS_ANTHROPIC_MODELS
+
+    monkeypatch.setattr(
+        databricks_executor,
+        "_read_databrickscfg_host",
+        lambda profile: "https://wkspc.example.com/",
+    )
+
+    provider = creds.resolve_pi_native_provider(config_loader=_databricks_config)
+
+    assert provider is not None
+    ids = [entry["id"] for entry in provider.to_models_config()["providers"]["omnigent"]["models"]]
+    assert ids == [entry["id"] for entry in DATABRICKS_ANTHROPIC_MODELS]
+    assert "databricks-claude-sonnet-4-6" in ids
+    assert "databricks-claude-opus-4-8" in ids
+
+
 def test_databricks_unresolvable_host_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
     """No host for the profile → fall back to Pi's own login (None)."""
     from omnigent.inner import databricks_executor
@@ -144,7 +170,48 @@ def test_to_models_config_shape() -> None:
     assert entry["api"] == "anthropic-messages"
     assert entry["apiKey"] == "!get-token"
     assert entry["authHeader"] is True
+    # No catalog supplied → prior single-model shape (bare id, no image caps).
     assert entry["models"] == [{"id": "databricks-claude-sonnet-4-6"}]
+
+
+def test_to_models_config_registers_full_catalog() -> None:
+    """A catalog is advertised in full, with the selected model deduped."""
+    catalog = (
+        {"id": "databricks-claude-opus-4-8", "input": ["text", "image"]},
+        {"id": "databricks-claude-sonnet-4-6", "input": ["text", "image"]},
+    )
+    provider = creds.PiProviderConfig(
+        provider_id="omnigent",
+        base_url="https://x/ai-gateway/anthropic",
+        api="anthropic-messages",
+        model="databricks-claude-sonnet-4-6",
+        api_key="!get-token",
+        auth_header=True,
+        catalog=catalog,
+    )
+    models = provider.to_models_config()["providers"]["omnigent"]["models"]
+    ids = [entry["id"] for entry in models]
+    # Every catalog model is offered, and the selected (in-catalog) model is
+    # not duplicated by the launch-default append.
+    assert ids == ["databricks-claude-opus-4-8", "databricks-claude-sonnet-4-6"]
+    assert ids.count("databricks-claude-sonnet-4-6") == 1
+
+
+def test_to_models_config_appends_selected_model_outside_catalog() -> None:
+    """A selected model absent from the catalog is appended so --model resolves."""
+    catalog = ({"id": "databricks-claude-sonnet-4-6", "input": ["text", "image"]},)
+    provider = creds.PiProviderConfig(
+        provider_id="omnigent",
+        base_url="https://x/ai-gateway/anthropic",
+        api="anthropic-messages",
+        model="databricks-claude-opus-4-7",
+        api_key="!get-token",
+        auth_header=True,
+        catalog=catalog,
+    )
+    models = provider.to_models_config()["providers"]["omnigent"]["models"]
+    ids = [entry["id"] for entry in models]
+    assert ids == ["databricks-claude-sonnet-4-6", "databricks-claude-opus-4-7"]
 
 
 def test_write_models_config_is_owner_only(tmp_path: Path) -> None:
@@ -697,9 +764,14 @@ def test_model_override_beats_databricks_default(monkeypatch: pytest.MonkeyPatch
 
     assert provider is not None
     assert provider.model == "databricks-claude-opus-4-7"
-    # The override flows all the way into the rendered models.json.
+    # The override flows all the way into the rendered models.json (an id
+    # outside the static catalog is appended), while the catalog stays
+    # advertised so /model still lists every gateway model.
     cfg = provider.to_models_config()
-    assert cfg["providers"]["omnigent"]["models"] == [{"id": "databricks-claude-opus-4-7"}]
+    model_ids = [entry["id"] for entry in cfg["providers"]["omnigent"]["models"]]
+    assert "databricks-claude-opus-4-7" in model_ids
+    assert "databricks-claude-sonnet-4-6" in model_ids
+    assert "databricks-claude-sonnet-4-5" in model_ids
 
 
 def test_model_override_beats_inline_family_default() -> None:

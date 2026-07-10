@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 from omnigent.model_override import normalize_model_for_provider
+from omnigent.onboarding.databricks_config import DATABRICKS_ANTHROPIC_MODELS
 from omnigent.onboarding.provider_config import (
     CHAT_WIRE_API,
     CLI_CONFIG_KIND,
@@ -137,6 +138,13 @@ class PiProviderConfig:
         request time, used for short-lived gateway tokens).
     :param auth_header: When ``True``, Pi sends ``Authorization: Bearer
         <apiKey>`` (gateways) instead of a provider-native key header.
+    :param catalog: Extra model entries to advertise alongside ``model`` so
+        Pi's ``/model`` picker lists every model the endpoint serves, not just
+        the launch default. Each entry is a Pi ``models.json`` model dict (at
+        least ``{"id": ...}``). Empty for providers without a known catalog
+        (e.g. arbitrary key/local endpoints), which keeps the prior
+        single-model behavior. ``model`` is always registered even when absent
+        here — see :meth:`to_models_config`.
     """
 
     provider_id: str
@@ -145,14 +153,28 @@ class PiProviderConfig:
     model: str
     api_key: str
     auth_header: bool
+    catalog: tuple[dict[str, Any], ...] = ()
 
     def to_models_config(self) -> dict[str, Any]:
-        """Render this provider as a Pi ``models.json`` mapping."""
+        """Render this provider as a Pi ``models.json`` mapping.
+
+        Registers the full :attr:`catalog` so Pi's ``/model`` picker (and
+        manual model entry, which Pi validates against registered ids) offers
+        every model the endpoint serves. The launch default (:attr:`model`,
+        passed to Pi via ``--model``) is guaranteed present: if it isn't in the
+        catalog it's appended as a bare ``{"id": ...}`` entry — matching the
+        prior single-model shape for providers that ship no catalog (arbitrary
+        key/local endpoints, where advertising image input on a text-only
+        model would turn silent drops into request errors).
+        """
+        models: list[dict[str, Any]] = [dict(entry) for entry in self.catalog]
+        if not any(entry.get("id") == self.model for entry in models):
+            models.append({"id": self.model})
         provider: dict[str, Any] = {
             "baseUrl": self.base_url,
             "api": self.api,
             "apiKey": self.api_key,
-            "models": [{"id": self.model}],
+            "models": models,
         }
         if self.auth_header:
             provider["authHeader"] = True
@@ -187,6 +209,7 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
         # force-refreshes), matching codex-native's refresh semantics.
         api_key=f"!{auth_command}",
         auth_header=True,
+        catalog=tuple(DATABRICKS_ANTHROPIC_MODELS),
     )
 
 
@@ -328,6 +351,7 @@ def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
         # request — matching codex-native's refresh semantics.
         api_key=f"!{transport.auth_command}",
         auth_header=True,
+        catalog=tuple(DATABRICKS_ANTHROPIC_MODELS),
     )
 
 
