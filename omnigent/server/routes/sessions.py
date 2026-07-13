@@ -582,6 +582,7 @@ _CODEX_NATIVE_WRAPPER_LABEL_VALUE = CODEX_NATIVE_CODING_AGENT.wrapper_label
 _CODEX_NATIVE_HARNESS = CODEX_NATIVE_CODING_AGENT.harness
 _CODEX_NATIVE_MODEL = CODEX_NATIVE_CODING_AGENT.agent_name
 _CURSOR_NATIVE_WRAPPER_LABEL_VALUE = CURSOR_NATIVE_CODING_AGENT.wrapper_label
+_CURSOR_NATIVE_HARNESS = CURSOR_NATIVE_CODING_AGENT.harness
 _KIRO_NATIVE_WRAPPER_LABEL_VALUE = KIRO_NATIVE_CODING_AGENT.wrapper_label
 _CLAUDE_NATIVE_MESSAGE_TIMEOUT_S = 30.0
 _NATIVE_TERMINAL_START_FAILED_CODE = "native_terminal_start_failed"
@@ -12070,12 +12071,12 @@ def _derive_terminal_launch_args_from_spec(sub_spec: AgentSpec) -> list[str] | N
     """
     Derive native-terminal YOLO pass-through args from a trusted sub-spec.
 
-    polly's native workers (claude-native / codex-native) launch in a
-    headless pane where no human can answer an ApprovalCard, so every
-    Edit/Write/Bash that prompts stalls the worker. This translates a
+    polly's native workers (claude-native / codex-native / cursor-native)
+    launch in a headless pane where no human can answer an ApprovalCard, so
+    every Edit/Write/Bash that prompts stalls the worker. This translates a
     worker bundle's declared full-bypass intent into the per-session
-    ``terminal_launch_args`` the runner already appends to the claude /
-    codex argv:
+    ``terminal_launch_args`` the runner already appends to the native CLI
+    argv:
 
     - claude-native + ``executor.config.permission_mode`` set ->
       ``["--permission-mode", "<value>"]``. The value is passed through
@@ -12092,12 +12093,21 @@ def _derive_terminal_launch_args_from_spec(sub_spec: AgentSpec) -> list[str] | N
       and the codex-sdk executor's ``approvalPolicy="never"``). An explicit
       ``executor.config.yolo: false`` opts back out for a read-only / must
       -keep-prompting sub-agent. See issue #171.
+    - cursor-native -> ``["--yolo"]`` by DEFAULT. Headless cursor workers
+      otherwise stall on cursor-agent's in-terminal approval prompts (also
+      mirrored as web elicitation cards). ``--yolo`` is cursor-agent's
+      don't-ask / full-bypass flag (``--auto-review`` still prompts for
+      some calls). An explicit ``executor.config.yolo: false`` opts back
+      out. When ``executor.config.permission_mode`` / ``exec_mode`` is set
+      to ``auto`` or ``auto-review``, emit ``["--auto-review"]`` instead
+      (Smart Auto) so a bundle can choose Claude-style auto without full
+      yolo.
 
-    Only the two native harnesses are translated; for any other harness
-    (e.g. ``claude-sdk``, whose bypass is set via the SDK ``permissionMode``
-    spawn env, not a terminal flag) this returns ``None`` so no terminal
-    args are set. ``None`` is also returned when the relevant field is
-    absent / falsey.
+    Only those native harnesses are translated; for any other harness
+    (e.g. ``claude-sdk`` / ``cursor``, whose bypass is set via the SDK
+    ``permissionMode`` / ``auto_review`` spawn path, not a terminal flag)
+    this returns ``None`` so no terminal args are set. ``None`` is also
+    returned when the relevant field is absent / falsey.
 
     :param sub_spec: The trusted child sub-agent spec, resolved from the
         server-loaded parent bundle via :func:`_resolve_subagent_spec`.
@@ -12124,6 +12134,22 @@ def _derive_terminal_launch_args_from_spec(sub_spec: AgentSpec) -> list[str] | N
         if _spec_config_flag_explicitly_disabled(sub_spec, "yolo"):
             return None
         return _validate_terminal_launch_args(["--dangerously-bypass-approvals-and-sandbox"])
+    if harness == _CURSOR_NATIVE_HARNESS:
+        # Prefer an explicit Smart Auto mode when the bundle asks for it
+        # (mirrors Claude's ``permission_mode: auto``), else full --yolo
+        # by default so headless polly workers don't stall on mirrored
+        # approval cards. ``yolo: false`` is the keep-prompting opt-out.
+        mode = (
+            sub_spec.executor.config.get("permission_mode")
+            or sub_spec.executor.config.get("exec_mode")
+            or ""
+        )
+        mode_norm = str(mode).strip().lower()
+        if mode_norm in ("auto", "auto-review"):
+            return _validate_terminal_launch_args(["--auto-review"])
+        if _spec_config_flag_explicitly_disabled(sub_spec, "yolo"):
+            return None
+        return _validate_terminal_launch_args(["--yolo"])
     return None
 
 
@@ -12460,12 +12486,12 @@ async def _create_session_from_existing_agent(
     # from the trusted, server-loaded sub-spec only — any caller-supplied
     # ``body.terminal_launch_args`` is ignored. This is the YOLO seam:
     # claude-native maps ``permission_mode`` to ``--permission-mode``,
-    # while codex-native defaults to full bypass
-    # (``--dangerously-bypass-approvals-and-sandbox``) so a headless
-    # codex worker can edit/run unattended without stalling on codex's
-    # on-request approval default (opt out with ``yolo: false``). A
-    # caller cannot inject launch wiring by smuggling args through the
-    # spawn body.
+    # codex-native defaults to full bypass
+    # (``--dangerously-bypass-approvals-and-sandbox``), and cursor-native
+    # defaults to ``--yolo`` so a headless worker can edit/run unattended
+    # without stalling on native approval prompts (opt out with
+    # ``yolo: false``). A caller cannot inject launch wiring by smuggling
+    # args through the spawn body.
     #
     # Sessions that resolve their own agent (top-level sessions and the
     # manual Add Agent child flow where ``sub_agent_name`` is null) keep

@@ -1372,7 +1372,8 @@ async def test_run_turn_native_tool_handler_approves(
         "result": "Done.",
     }
     _install_fake_sdk(monkeypatch, [script])
-    executor = CursorExecutor(api_key="crsr_x")
+    # Interactive mode keeps per-tool elicitation; auto (default) would skip it.
+    executor = CursorExecutor(api_key="crsr_x", permission_mode="default")
     # No policy evaluator — handler alone is sufficient to show the card.
 
     async def _approve(_name: str, _args: dict[str, Any]) -> bool:
@@ -1401,7 +1402,7 @@ async def test_run_turn_native_tool_handler_denies(
         "result": "",
     }
     _install_fake_sdk(monkeypatch, [script])
-    executor = CursorExecutor(api_key="crsr_x")
+    executor = CursorExecutor(api_key="crsr_x", permission_mode="default")
 
     async def _deny(_name: str, _args: dict[str, Any]) -> bool:
         return False
@@ -1474,7 +1475,7 @@ async def test_run_turn_native_tool_ask_user_approves(
         "result": "Done.",
     }
     _install_fake_sdk(monkeypatch, [script])
-    executor = CursorExecutor(api_key="crsr_x")
+    executor = CursorExecutor(api_key="crsr_x", permission_mode="default")
     executor._policy_evaluator = _policy_ask("PHASE_TOOL_CALL")
 
     async def _approve(_name: str, _args: dict[str, Any]) -> bool:
@@ -1503,7 +1504,7 @@ async def test_run_turn_native_tool_ask_user_denies(
         "result": "",
     }
     _install_fake_sdk(monkeypatch, [script])
-    executor = CursorExecutor(api_key="crsr_x")
+    executor = CursorExecutor(api_key="crsr_x", permission_mode="default")
     executor._policy_evaluator = _policy_ask("PHASE_TOOL_CALL")
 
     async def _deny(_name: str, _args: dict[str, Any]) -> bool:
@@ -1518,6 +1519,40 @@ async def test_run_turn_native_tool_ask_user_denies(
     errors = [e for e in events if isinstance(e, ExecutorError)]
     assert len(errors) == 1
     assert not any(isinstance(e, TurnComplete) for e in events)
+
+
+async def test_run_turn_native_tool_auto_mode_skips_elicitation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Default ``permission_mode=auto`` skips the web-UI approval card."""
+    script = {
+        "messages": [
+            _assistant("Running."),
+            _tool("bash", "t1", "running", args={"cmd": "ls"}),
+            _tool("bash", "t1", "completed", result="file.txt"),
+            _assistant("Done."),
+        ],
+        "status": "finished",
+        "result": "Done.",
+    }
+    _install_fake_sdk(monkeypatch, [script])
+    executor = CursorExecutor(api_key="crsr_x")  # default permission_mode=auto
+    handler_called = False
+
+    async def _deny(_name: str, _args: dict[str, Any]) -> bool:
+        nonlocal handler_called
+        handler_called = True
+        return False
+
+    executor._elicitation_handler = _deny
+    try:
+        events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
+    finally:
+        await executor.close()
+
+    assert not handler_called
+    assert any(isinstance(e, TurnComplete) for e in events)
+    assert not any(isinstance(e, ExecutorError) for e in events)
 
 
 # ---------------------------------------------------------------------------
