@@ -470,9 +470,15 @@ class OpenCodeNativeForwarder:
         # can't grow across a long-lived session (the next turn's reasoning
         # parts carry fresh ids anyway).
         self._reasoning_posted.clear()
-        # Stamp the terminal edge with the turn's response_id (the id the running
-        # edge carried), then merge any caller-supplied fields on top.
-        merged_extra: dict[str, Any] = {"response_id": self._response_id(self._active_message_id)}
+        # Stamp the terminal edge with the id the ``running`` edge actually went
+        # out with (``_running_response_id``), then merge any caller-supplied
+        # fields on top. If a turn produced more than one assistant messageID,
+        # ``_active_message_id`` has advanced past the id that went live; using
+        # the running id keeps both edges consistent so the web retires the cards
+        # that were rendered live. Fall back to the latest assistant id (then the
+        # session id) when no running edge fired.
+        terminal_id = self._running_response_id or self._active_message_id
+        merged_extra: dict[str, Any] = {"response_id": self._response_id(terminal_id)}
         if extra:
             merged_extra.update(extra)
         if self._bridge_dir is not None:

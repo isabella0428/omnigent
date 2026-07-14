@@ -389,6 +389,43 @@ async def test_second_turn_gets_its_own_running_response_id() -> None:
     ]
 
 
+async def test_multi_assistant_message_turn_retires_with_the_live_id() -> None:
+    """Two assistant messages in ONE turn: idle carries the id that went live.
+
+    If opencode emits more than one assistant ``message.updated`` before
+    ``session.idle`` (no idle between them), the ``running`` edge locks to the
+    first id (``msg_1``) while ``_active_message_id`` advances to ``msg_2``. The
+    terminal ``idle`` edge must still carry ``msg_1`` — the id the running edge
+    used — so the web retires the tool cards that were actually rendered live.
+    """
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_1", "role": "assistant"}))
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_2", "role": "assistant"}))
+    await fwd.handle_event(_event("session.idle"))
+    edges = _status_edges(server.posts)
+    assert [(e["status"], e["response_id"]) for e in edges] == [
+        ("running", "msg_1"),
+        ("idle", "msg_1"),
+    ]
+
+
+async def test_turn_without_assistant_message_idles_with_session_fallback() -> None:
+    """A turn that opens (busy) and idles with no assistant ``message.updated``.
+
+    No ``running`` edge fires (there was never an id to carry) and the terminal
+    ``idle`` edge falls back to the session id. Benign — there are no live tool
+    cards to retire — but the fallback id is deliberate, not a mismatch bug.
+    """
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_event("session.status", status={"type": "busy"}))
+    await fwd.handle_event(_event("session.idle"))
+    edges = _status_edges(server.posts)
+    assert [e["status"] for e in edges] == ["idle"]
+    assert edges[0]["response_id"] == _SESSION
+
+
 async def test_permission_asked_rejects_when_no_policy_wired() -> None:
     """Absent a policy evaluator the forwarder FAILS CLOSED (no auto-approve).
 
