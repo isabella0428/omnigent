@@ -2898,8 +2898,9 @@ def inject_user_message(
                 last_enter = time.monotonic()
         if not submitted:
             raise RuntimeError(
-                f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "
-                "(the draft is still in the input box). The message was not delivered."
+                "Claude Code did not accept the submitted message within "
+                f"{_SUBMIT_VERIFY_TIMEOUT_S}s (the draft is still in the input box). "
+                "The message was not delivered."
             )
     if not verify_delivery:
         # Legacy behavior for mid-turn steering: the pane-level submit above

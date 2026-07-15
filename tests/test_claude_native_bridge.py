@@ -2935,6 +2935,7 @@ def _shrink_ack_timers(monkeypatch: pytest.MonkeyPatch) -> None:
         "_CLAUDE_READY_POLL_INTERVAL_S": 0.01,
         "_SUBMIT_RETRY_INTERVAL_S": 0.02,
         "_PASTE_SETTLE_S": 0.0,
+        "_SUBMIT_VERIFY_TIMEOUT_S": 0.15,
         "_SUBMIT_ACK_TIMEOUT_S": 0.15,
         "_TURN_START_SETTLE_S": 0.03,
         "_TURN_START_TIMEOUT_S": 0.15,
@@ -3044,28 +3045,30 @@ def test_inject_user_message_raises_on_draft_restore_stall(
     )
     record_hook_event(bridge_dir, {"hook_event_name": "SessionStart", "session_id": "p"})
 
-    state = {"pane": "❯ ", "restored": False}
+    state = {"pane": "❯ ", "submitted": False}
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
         del kwargs
         if "capture-pane" in cmd:
-            # Once restored, the pane keeps showing the draft (the stall).
-            return SimpleNamespace(
-                returncode=0,
-                stdout=("❯ stalled message" if state["restored"] else state["pane"]),
-                stderr="",
-            )
+            pane = state["pane"]
+            # The submit momentarily clears the box — the first capture-pane
+            # read after that clear sees empty, so the TUI-level submit
+            # verification passes — then draft-restore bounces the text back
+            # into the box for the delivery ack to catch as a stall.
+            if state["submitted"] and pane == "❯ ":
+                state["pane"] = "❯ stalled message"
+            return SimpleNamespace(returncode=0, stdout=pane, stderr="")
         if "paste-buffer" in cmd:
             state["pane"] = "❯ stalled message"
         if cmd[-1] == "Enter":
-            if not state["restored"]:
-                # First submit registers, box momentarily clears...
+            if not state["submitted"]:
+                # First submit registers and the box momentarily clears...
                 state["pane"] = "❯ "
                 record_hook_event(
                     bridge_dir, {"hook_event_name": "UserPromptSubmit", "session_id": "p"}
                 )
                 # ...then draft-restore puts it back; no turn-start hook ever fires.
-                state["restored"] = True
+                state["submitted"] = True
             # Subsequent (nudge) Enters do NOT start a turn — the stall persists.
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
