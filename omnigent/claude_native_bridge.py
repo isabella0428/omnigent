@@ -2816,7 +2816,7 @@ def inject_user_message(
     # delivery ack can tell this message's UserPromptSubmit / turn-start
     # apart from prior activity. read_hook_events_since(..., 0) returns the
     # current complete-record count as its cursor.
-    hook_cursor, _names = read_hook_events_since(bridge_dir, 0)
+    hook_cursor, _ = read_hook_events_since(bridge_dir, 0)
     ack_transcript_path = read_transcript_path(bridge_dir)
     transcript_cursor = _count_transcript_lines(ack_transcript_path)
     # Clear any leftover text in Claude's input field before typing.
