@@ -153,6 +153,13 @@ export interface Conversation {
    * matched. Absent on non-search fetches and title-only matches.
    */
   search_snippet?: string | null;
+  /**
+   * For sub-agent sessions, the id of the direct parent session.
+   * `null` / absent for top-level sessions. Included in
+   * `WS /v1/sessions/updates` frames so `SessionUpdatesProvider` can
+   * invalidate the parent's child-sessions cache when the child changes.
+   */
+  parent_session_id?: string | null;
 }
 
 export interface ConversationsPage {
