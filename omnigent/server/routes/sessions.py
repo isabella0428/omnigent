@@ -604,7 +604,7 @@ _NATIVE_TERMINAL_ENSURE_FAILED_CODE = "native_terminal_ensure_failed"
 # the reason once via ``policy_hook_disabled_reason`` in its
 # terminal-ensure 200 response.
 _NATIVE_POLICY_NOT_ENFORCED_CODE = "native_policy_not_enforced"
-_HOST_BOUND_RUNNER_CONNECT_GRACE_S = 3.0
+_HOST_BOUND_RUNNER_CONNECT_GRACE_S = 10.0
 _HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S = 30.0
 _MANAGED_RESUMABLE_TUNNEL_STALE_S = 30.0
 # How often the runner-connect wait re-checks the crash-report store while

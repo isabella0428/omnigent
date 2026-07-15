@@ -5006,8 +5006,12 @@ export function computeIsWorking(sessionStatus: SessionStatus): boolean {
  * @param options.hasPendingElicitation - ``true`` when an elicitation prompt
  *   owns the in-progress slot and should suppress the shimmer/pinned pill.
  * @param options.runnerOnline - Runner liveness: ``true`` online, ``false``
- *   known offline, ``undefined`` before the health poll resolves. Only known
- *   offline suppresses the indicator.
+ *   known offline, ``undefined`` before the health poll resolves. A known-offline
+ *   runner suppresses the indicator ONLY when the session is otherwise idle: a
+ *   session actively reporting ``running``/``waiting`` cannot have an offline
+ *   runner, so its live status wins over the ``/health`` poll — which polls at a
+ *   10s cadence and reads stale-offline during the runner's connect window on a
+ *   fresh session's first turn (it would otherwise hide "Working…" for seconds).
  * @param options.backgroundTaskCount - Background shells still running after
  *   the turn ended. A claude-native turn settles to ``idle`` (the PTY-activity
  *   watcher's edge) even while shells run, so the bare status alone would hide
@@ -5023,9 +5027,14 @@ export function computeShowsWorking(
     backgroundTaskCount?: number;
   },
 ): boolean {
-  if (options.runnerOnline === false) return false;
   if (options.hasPendingElicitation) return false;
-  return computeIsWorking(sessionStatus) || (options.backgroundTaskCount ?? 0) > 0;
+  const isWorking = computeIsWorking(sessionStatus);
+  // A running/waiting session is proof the runner is up, so a stale
+  // poll-derived ``runnerOnline === false`` must not suppress it. Only gate on
+  // known-offline for the not-actively-working case (e.g. a background-shell
+  // tally on an idle session).
+  if (options.runnerOnline === false && !isWorking) return false;
+  return isWorking || (options.backgroundTaskCount ?? 0) > 0;
 }
 
 /**
