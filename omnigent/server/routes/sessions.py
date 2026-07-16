@@ -12876,6 +12876,9 @@ async def _create_session_from_existing_agent(
                 if _client_header in ("web", "desktop", "ios", "android", "cli")
                 else _classify_surface(request.headers.get("user-agent"))
             )
+            _host_install_id: str | None = None
+            if _hr is not None and conv.host_id is not None:
+                _host_install_id = _hr.get_host_installation_id(conv.host_id)
             _tel_emit(
                 _TelSessionCreatedEvent(
                     session_id=conv.id,
@@ -12884,6 +12887,7 @@ async def _create_session_from_existing_agent(
                     surface=_surface,
                     installation_id=_install_id,
                     anon_user_id=_anon_uid,
+                    host_installation_id=_host_install_id,
                     is_fork=body.parent_session_id is not None,
                     is_sub_agent=body.sub_agent_name is not None,
                 )

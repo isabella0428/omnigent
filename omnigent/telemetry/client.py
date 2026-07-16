@@ -285,6 +285,7 @@ def _build_record(event: object) -> dict[str, Any]:
     installation_id: str | None = fields.pop("installation_id", None)
     session_id: str | None = fields.pop("session_id", None)
     anon_user_id: str | None = fields.pop("anon_user_id", None)
+    host_installation_id: str | None = fields.pop("host_installation_id", None)
 
     # All remaining event-specific fields go into params as a JSON string.
     params_str: str | None = None
@@ -303,6 +304,7 @@ def _build_record(event: object) -> dict[str, Any]:
         "duration_ms": 0,
         "installation_id": installation_id,
         "anon_user_id": anon_user_id,
+        "host_installation_id": host_installation_id,
         "environment": _detect_environment(),
         "params": params_str,
     }
