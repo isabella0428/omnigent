@@ -116,7 +116,10 @@ token exchange without uploading. The real run binds the per-package
 Trusted-Publisher environments (may gate on reviewer approval) and re-verifies
 that `ref` is exactly the tag and points at the built commit.
 
-**3. Validate from PyPI** (clean venv; exact pins resolve pre-releases):
+**3. Validate from PyPI** (clean venv; exact pins resolve pre-releases;
+behind a corporate network, point `--index-url` at your PyPI mirror
+instead — this is a manual step on purpose: the secure repo's runners
+cannot see a fresh index view, so no CI job can do it):
 
 ```bash
 python -m venv /tmp/omni-rc && /tmp/omni-rc/bin/pip install \
@@ -235,18 +238,19 @@ The examples below use `0.0.1rc2`; substitute the next free number.
    Cancelled (superseded) runs only warn.
 3. **Idempotency**: dispatch the exact same command again — it must no-op
    ("already at the converged release commit").
-4. **Secure-repo publish.** Real PyPI is safe for a below-latest rc and is
-   the only destination that exercises the post-publish `validate` job — so
-   rehearse against `destination=pypi` (it binds the per-package reviewer
-   environments; approve all three). `destination=test-pypi` also works, but
-   skips the prod tag gate and `validate`, and needs TestPyPI Trusted
-   Publishers configured.
+4. **Secure-repo publish.** Real PyPI is safe for a below-latest rc and
+   exercises the full prod path (the tag gate + the per-package reviewer
+   environments; approve all three) — so rehearse against
+   `destination=pypi`. `destination=test-pypi` also works, but skips the
+   prod tag gate and needs TestPyPI Trusted Publishers configured. Then
+   validate the published rc manually, exactly like a real release (step 3
+   of the standard flow).
 
    ```bash
    gh workflow run omnigent.yml --repo databricks/secure-public-registry-releases-eng \
      -f ref=v0.0.1rc2 -f destination=pypi -f dry-run=true    # gates only
    gh workflow run omnigent.yml --repo databricks/secure-public-registry-releases-eng \
-     -f ref=v0.0.1rc2 -f destination=pypi -f dry-run=false   # publish + validate
+     -f ref=v0.0.1rc2 -f destination=pypi -f dry-run=false   # real publish
    ```
 
 5. **No-double-publish check** (optional): re-dispatching step 4's second

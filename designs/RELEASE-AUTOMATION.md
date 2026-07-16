@@ -464,7 +464,11 @@ effects. Worth stealing:
 > ("File already exists") and a partial publish is recovered by yank + next
 > version, as it always was. The peer-survey skip-existing citations stand
 > as facts about those projects; they don't transfer to egress-restricted
-> runners.
+> runners. The **`validate` job is withdrawn for the same reason**: the
+> runners' only index view is a JFrog mirror whose metadata lags weeks
+> behind PyPI (its first live run couldn't see the version it had just
+> published — nor even 0.5.x), so post-publish validation stays the manual
+> runbook step, run from a network with a fresh PyPI view.
 
 1. **Secure-repo restructure: approved direction** — gates → env-approval →
    publish (skip-existing — *withdrawn, see correction above*) → validate,
