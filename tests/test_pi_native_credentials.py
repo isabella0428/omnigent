@@ -697,9 +697,11 @@ def test_model_override_beats_databricks_default(monkeypatch: pytest.MonkeyPatch
 
     assert provider is not None
     assert provider.model == "databricks-claude-opus-4-7"
-    # The override flows all the way into the rendered models.json.
+    # The override is the launched model and is registered under the Anthropic
+    # provider (now listed alongside the static Claude catalog for /model).
     cfg = provider.to_models_config()
-    assert cfg["providers"]["omnigent"]["models"] == [{"id": "databricks-claude-opus-4-7"}]
+    anthropic_ids = [m["id"] for m in cfg["providers"]["omnigent"]["models"]]
+    assert "databricks-claude-opus-4-7" in anthropic_ids
 
 
 def test_model_override_beats_inline_family_default() -> None:
@@ -819,3 +821,196 @@ def test_inline_family_passes_non_mechanical_override_through() -> None:
     assert provider.model == "zai-org/GLM-4.7"
     cfg = provider.to_models_config()
     assert cfg["providers"]["omnigent"]["models"] == [{"id": "zai-org/GLM-4.7"}]
+
+
+# ── #2575: family-aware routing for non-Claude Databricks gateway models ──
+
+
+def _resolve_databricks_native(
+    monkeypatch: pytest.MonkeyPatch, model: str | None
+) -> creds.PiProviderConfig | None:
+    """Resolve the Databricks-profile pi-native provider for *model*."""
+    from omnigent.inner import databricks_executor
+
+    monkeypatch.setattr(
+        databricks_executor,
+        "_read_databrickscfg_host",
+        lambda profile: "https://wkspc.example.com/",
+    )
+    return creds.resolve_pi_native_provider(model=model, config_loader=_databricks_config)
+
+
+def test_databricks_non_claude_routes_to_openai_completions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-Claude Databricks model routes to the OpenAI-completions surface.
+
+    Regression for #2575: GLM/Gemini/DeepSeek are not served on the Anthropic
+    Messages surface (the gateway returns "API type 'anthropic/v1/messages' is
+    not supported"), so the resolver must point Pi at the OpenAI-compatible
+    ``/serving-endpoints`` surface instead of hanging on ``/ai-gateway/anthropic``.
+    """
+    provider = _resolve_databricks_native(monkeypatch, "databricks-glm-5-2")
+
+    assert provider is not None
+    assert provider.api == "openai-completions"
+    assert provider.base_url == "https://wkspc.example.com/serving-endpoints"
+    assert provider.model == "databricks-glm-5-2"
+    assert provider.auth_header is False
+    assert provider.api_key.startswith("!")
+    # Launch selects the OpenAI-completions provider, not the Anthropic one.
+    assert provider.provider_id == "omnigent-completions"
+
+
+def test_databricks_catalogs_reuse_harness_lists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The rendered catalogs ARE the shared curated lists (single source of truth).
+
+    No duplicated model lists: every entry of the shared Claude and GPT
+    catalogs (``onboarding/databricks_config.py`` — the same lists the
+    in-process harness renders) must appear verbatim — same ids, same
+    metadata — under the corresponding pi-native provider, so the two paths can
+    never drift apart.
+    """
+    from omnigent.onboarding.databricks_config import (
+        DATABRICKS_ANTHROPIC_MODELS,
+        DATABRICKS_GPT_MODELS,
+    )
+
+    provider = _resolve_databricks_native(monkeypatch, "databricks-claude-opus-4-8")
+    assert provider is not None
+    providers = provider.to_models_config()["providers"]
+    anthropic = {m["id"]: m for m in providers["omnigent"]["models"]}
+    completions = {m["id"]: m for m in providers["omnigent-completions"]["models"]}
+    for source in DATABRICKS_ANTHROPIC_MODELS:
+        assert anthropic[source["id"]]["contextWindow"] == source["contextWindow"]
+        assert anthropic[source["id"]]["maxTokens"] == source["maxTokens"]
+    for source in DATABRICKS_GPT_MODELS:
+        assert completions[source["id"]]["contextWindow"] == source["contextWindow"]
+    # ...plus the #2575 non-Claude models the harness's catch-all doesn't list.
+    assert "databricks-glm-5-2" in completions
+    assert "databricks-gemini-3-5-flash" in completions
+    # Rendering must not have mutated the shared module-level catalog lists.
+    assert all("reasoning" not in entry for entry in DATABRICKS_GPT_MODELS)
+
+
+def test_databricks_non_claude_sets_developer_role_compat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The OpenAI-completions block disables the ``developer`` role (Gemini fix).
+
+    Databricks-gatewayed Gemini rejects the OpenAI ``developer`` role Pi sends by
+    default; the rendered provider must carry ``supportsDeveloperRole: False``.
+    """
+    provider = _resolve_databricks_native(monkeypatch, "databricks-gemini-3-5-flash")
+    assert provider is not None
+    block = provider.to_models_config()["providers"]["omnigent-completions"]
+    assert block["api"] == "openai-completions"
+    assert block["compat"]["supportsDeveloperRole"] is False
+    assert block["compat"]["supportsReasoningEffort"] is False
+
+
+def test_databricks_glm_flags_reasoning_gemini_does_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GLM/DeepSeek entries carry ``reasoning: true``; Gemini does not (#2575).
+
+    GLM and DeepSeek stream chain-of-thought on ``reasoning_content``; Pi needs
+    the flag to surface it. Gemini streams normally, so it stays unflagged.
+    """
+    glm = _resolve_databricks_native(monkeypatch, "databricks-glm-5-2")
+    assert glm is not None
+    glm_models = {
+        m["id"]: m for m in glm.to_models_config()["providers"]["omnigent-completions"]["models"]
+    }
+    assert glm_models["databricks-glm-5-2"].get("reasoning") is True
+
+    gemini = _resolve_databricks_native(monkeypatch, "databricks-gemini-3-5-flash")
+    assert gemini is not None
+    gemini_models = {
+        m["id"]: m
+        for m in gemini.to_models_config()["providers"]["omnigent-completions"]["models"]
+    }
+    assert "reasoning" not in gemini_models["databricks-gemini-3-5-flash"]
+
+
+def test_databricks_non_claude_registers_anthropic_companion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-Claude launch still registers the Anthropic provider for discovery.
+
+    The issue asks for "secondary provider registration for model discovery": Pi's
+    ``/model`` picker must still offer Claude, so the Anthropic surface is
+    registered alongside the OpenAI one (with the Claude default id).
+    """
+    provider = _resolve_databricks_native(monkeypatch, "databricks-glm-5-2")
+    assert provider is not None
+    providers = provider.to_models_config()["providers"]
+    assert set(providers) == {"omnigent-completions", "omnigent"}
+    assert providers["omnigent"]["api"] == "anthropic-messages"
+    anthropic_ids = [m["id"] for m in providers["omnigent"]["models"]]
+    assert "databricks-claude-sonnet-4-6" in anthropic_ids
+
+
+def test_databricks_non_claude_launch_selects_completions_provider(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Launch pins ``--provider omnigent-completions`` for a non-Claude model."""
+    provider = _resolve_databricks_native(monkeypatch, "databricks-glm-5-2")
+    assert provider is not None
+    _env, args = creds.pi_native_provider_launch(tmp_path / "pi-agent", provider)
+    assert args == ["--provider", "omnigent-completions", "--model", "databricks-glm-5-2"]
+    written = json.loads((tmp_path / "pi-agent" / "models.json").read_text(encoding="utf-8"))
+    assert set(written["providers"]) == {"omnigent-completions", "omnigent"}
+
+
+def test_databricks_claude_launch_registers_both_families(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Claude launch boots on Anthropic but registers both families (symmetric /model).
+
+    Launching Claude selects the Anthropic surface, yet the OpenAI-completions
+    surface is registered alongside it (with the non-Claude catalog) so Pi's
+    ``/model`` picker can switch to GLM/Gemini without a relaunch.
+    """
+    provider = _resolve_databricks_native(monkeypatch, "databricks-claude-opus-4-8")
+    assert provider is not None
+    # launch boots on the Anthropic surface
+    assert provider.api == "anthropic-messages"
+    assert provider.base_url == "https://wkspc.example.com/ai-gateway/anthropic"
+    assert provider.provider_id == "omnigent"
+    assert provider.model == "databricks-claude-opus-4-8"
+    # both families registered for the picker
+    providers = provider.to_models_config()["providers"]
+    assert set(providers) == {"omnigent", "omnigent-completions"}
+    assert providers["omnigent-completions"]["api"] == "openai-completions"
+    completions_ids = [m["id"] for m in providers["omnigent-completions"]["models"]]
+    assert "databricks-glm-5-2" in completions_ids
+
+
+def test_cli_config_non_claude_defers_to_anthropic_surface(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """cli-config non-Claude routing is deferred with a clear warning (#2575 follow-up).
+
+    The cli-config gateway is the ai-gateway subdomain, whose serving-endpoints
+    host we can't safely derive, so a non-Claude selection keeps the prior
+    Anthropic-surface behavior (honoring the requested id so it errors loudly)
+    and logs why — rather than silently swapping to a Claude model.
+    """
+    import logging
+
+    _write_codex_config(tmp_path, _DATABRICKS_CODEX_CONFIG)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.pi_native_credentials"):
+        provider = creds.resolve_pi_native_provider(
+            model="databricks-glm-5-2", config_loader=_cli_config_databricks_config
+        )
+    assert provider is not None
+    # Requested id honored (loud failure on the wrong surface > silent swap).
+    assert provider.model == "databricks-glm-5-2"
+    assert provider.api == "anthropic-messages"
+    assert set(provider.to_models_config()["providers"]) == {"omnigent"}
+    assert any("#2575" in rec.getMessage() for rec in caplog.records)

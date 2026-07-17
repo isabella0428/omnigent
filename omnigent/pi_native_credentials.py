@@ -22,12 +22,16 @@ import json
 import logging
 import os
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 from omnigent.model_override import normalize_model_for_provider
+from omnigent.onboarding.databricks_config import (
+    DATABRICKS_ANTHROPIC_MODELS,
+    DATABRICKS_GPT_MODELS,
+)
 from omnigent.onboarding.provider_config import (
     CHAT_WIRE_API,
     CLI_CONFIG_KIND,
@@ -74,6 +78,58 @@ _DATABRICKS_ANTHROPIC_GATEWAY_PATH = "/ai-gateway/anthropic"
 # base_url; pi-native rewrites it to the Anthropic surface Pi speaks natively.
 _DATABRICKS_GATEWAY_CODEX_SUFFIX = "/codex/v1"
 _DATABRICKS_GATEWAY_ANTHROPIC_SUFFIX = "/anthropic"
+
+# Databricks serving-endpoints surface: the OpenAI-compatible endpoint
+# (``/serving-endpoints/v1/chat/completions``) that non-Claude gateway models
+# (GLM, Gemini, DeepSeek, …) are served on. Pi speaks it via
+# ``api: openai-completions``. The gateway rejects these models on the
+# Anthropic Messages surface ("API type 'anthropic/v1/messages' is not
+# supported"), so routing them here is the fix for #2575. Mirrors the
+# in-process harness (``inner/pi_executor._build_models_json``), which routes
+# the same families to this surface.
+_DATABRICKS_SERVING_ENDPOINTS_PATH = "/serving-endpoints"
+
+# Provider id for the OpenAI-completions (serving-endpoints) surface in the
+# generated ``models.json``. Distinct from ``_PI_PROVIDER_ID`` (the Anthropic
+# surface) so both families can be registered side by side and Pi's ``/model``
+# picker can offer either — the "secondary provider registration for model
+# discovery" the issue calls for.
+_PI_OPENAI_PROVIDER_ID = "omnigent-completions"
+
+# Compatibility flags Pi applies on the Databricks OpenAI-completions surface.
+# ``supportsDeveloperRole: False`` is the load-bearing one for #2575 —
+# Databricks-gatewayed Gemini rejects the OpenAI ``developer`` role Pi sends by
+# default; the rest mirror the proven harness-path settings. Stored as a tuple
+# of pairs so ``PiProviderConfig`` stays a hashable frozen dataclass.
+_DATABRICKS_OPENAI_COMPAT: tuple[tuple[str, bool], ...] = (
+    ("supportsDeveloperRole", False),
+    ("supportsStore", False),
+    ("supportsStrictMode", False),
+    ("supportsReasoningEffort", False),
+)
+
+# Model-id substrings whose Databricks endpoints stream chain-of-thought on
+# ``reasoning_content`` rather than ``content``; Pi needs ``reasoning: true`` on
+# the model entry to surface it (per #2575). NOTE: the exact Pi ``models.json``
+# key is owned by the Pi CLI — confirm against its schema before relying on it.
+_PI_REASONING_MODEL_MARKERS: tuple[str, ...] = ("glm", "deepseek")
+
+# The static Claude / GPT catalogs are NOT duplicated here: they live in their
+# shared home, ``omnigent.onboarding.databricks_config`` (imported above; the
+# in-process harness ``inner/pi_executor`` renders the same lists — single
+# source of truth). The only ids with no existing home are the non-Claude
+# models #2575 establishes on the gateway (the harness's catch-all list is
+# deliberately empty because these ids churn): registered here, in the same
+# entry shape the shared lists use, until a live catalog (cf. #2369) replaces
+# static seeding.
+_DATABRICKS_PI_EXTRA_COMPLETIONS_MODELS: tuple[dict[str, Any], ...] = (
+    {"id": "databricks-glm-5-2", "input": ["text", "image"]},
+    {"id": "databricks-gemini-3-5-flash", "input": ["text", "image"]},
+)
+# Launch id for the OpenAI-completions surface when a session boots on Claude:
+# that provider is the (launch-inert) companion then, but still needs a concrete
+# ``model`` — a stable id from the shared GPT list.
+_DATABRICKS_PI_OPENAI_DEFAULT_MODEL = "databricks-gpt-5-5"
 
 # Trusted parent domain suffixes for a Databricks-owned host. The AI Gateway
 # lives under a per-workspace subdomain of one of these (the canonical form is
@@ -137,6 +193,17 @@ class PiProviderConfig:
         request time, used for short-lived gateway tokens).
     :param auth_header: When ``True``, Pi sends ``Authorization: Bearer
         <apiKey>`` (gateways) instead of a provider-native key header.
+    :param compat: Pi ``compat`` flags for the block (tuple of ``(name, bool)``
+        pairs); ``()`` for providers that need none.
+    :param image_input: When ``True``, declare ``input: ["text", "image"]`` on
+        every model entry.
+    :param reasoning: When ``True``, flag reasoning-capable ids (GLM/DeepSeek)
+        in this provider's catalog with ``reasoning: true``.
+    :param catalog: Pi model entries (``{"id": ..., ...}`` mappings, the same
+        shape the harness lists use) to advertise under this provider; the
+        launch ``model`` is appended when absent. Empty means just ``model``.
+    :param companions: Extra provider blocks to register alongside this one
+        (for model discovery); they never drive launch selection.
     """
 
     provider_id: str
@@ -145,18 +212,185 @@ class PiProviderConfig:
     model: str
     api_key: str
     auth_header: bool
+    # ``compat`` block for the Databricks OpenAI-completions surface (empty for
+    # every other provider). Tuple-of-pairs to keep the frozen dataclass
+    # hashable; rendered back to a dict in ``_render_block``.
+    compat: tuple[tuple[str, bool], ...] = ()
+    # Declare image input on the model entry (mirrors the harness path; avoids
+    # Pi silently dropping attached images for a dynamically-registered id, #515).
+    image_input: bool = False
+    # When ``True``, flag any reasoning-capable id (GLM/DeepSeek) in this
+    # provider's catalog with ``reasoning: true`` — Databricks serving-endpoints
+    # streams their chain-of-thought on ``reasoning_content`` (#2575). Left off
+    # for vendor-direct providers, which make no such assumption.
+    reasoning: bool = False
+    # Model entries to list under this provider (Pi's /model picker shows exactly
+    # the registered ids). Reused verbatim from the harness's static lists, so
+    # they carry the curated metadata (contextWindow/maxTokens/name/input).
+    # Empty → just this provider's launch ``model``.
+    catalog: tuple[dict[str, Any], ...] = ()
+    # Additional provider blocks to also register (e.g. the Anthropic surface
+    # registered alongside the OpenAI one so Pi's ``/model`` picker offers both
+    # families). Companions are launch-inert — only the top-level
+    # ``provider_id``/``model`` drive ``--provider``/``--model`` selection.
+    companions: tuple[PiProviderConfig, ...] = ()
 
-    def to_models_config(self) -> dict[str, Any]:
-        """Render this provider as a Pi ``models.json`` mapping."""
+    def _render_block(self) -> dict[str, Any]:
+        """Render this single provider as one Pi ``models.json`` provider block."""
+        # Copy each catalog entry so flagging below never mutates the shared
+        # module-level lists (the harness's "rebind, don't append" concern).
+        models: list[dict[str, Any]] = [dict(entry) for entry in self.catalog]
+        if not any(entry.get("id") == self.model for entry in models):
+            # Pi only accepts a ``provider/<id>`` selector whose id is
+            # registered under that provider, so the launch model must appear
+            # even when it's newer than the static catalog. Declare image input
+            # for the dynamically-registered id (mirrors the harness, #515).
+            entry = {"id": self.model}
+            if self.image_input:
+                entry["input"] = ["text", "image"]
+            models.append(entry)
+        if self.reasoning:
+            for entry in models:
+                if _is_reasoning_model(str(entry.get("id", ""))):
+                    entry.setdefault("reasoning", True)
         provider: dict[str, Any] = {
             "baseUrl": self.base_url,
             "api": self.api,
             "apiKey": self.api_key,
-            "models": [{"id": self.model}],
+            "models": models,
         }
         if self.auth_header:
             provider["authHeader"] = True
-        return {"providers": {self.provider_id: provider}}
+        if self.compat:
+            provider["compat"] = dict(self.compat)
+        return provider
+
+    def to_models_config(self) -> dict[str, Any]:
+        """Render this provider (and any companions) as a Pi ``models.json`` mapping."""
+        providers: dict[str, Any] = {self.provider_id: self._render_block()}
+        for companion in self.companions:
+            providers[companion.provider_id] = companion._render_block()
+        return {"providers": providers}
+
+
+def _is_claude_model(model: str) -> bool:
+    """Return whether *model* is a Claude-family id (routes to Anthropic Messages).
+
+    Databricks gateway ids keep their mechanical ``databricks-`` prefix on this
+    path (unlike the vendor-direct inline path), so ``databricks-claude-*`` and a
+    bare ``claude-*`` both match, while ``databricks-glm-5-2`` /
+    ``databricks-gemini-*`` / ``databricks-deepseek-*`` do not.
+    """
+    return "claude" in model.lower()
+
+
+def _is_reasoning_model(model: str) -> bool:
+    """Return whether *model* streams chain-of-thought on ``reasoning_content``.
+
+    GLM and DeepSeek endpoints on the Databricks gateway emit reasoning on
+    ``reasoning_content`` rather than ``content``; Pi needs ``reasoning: true``
+    on the model entry to surface it (#2575).
+    """
+    lower = model.lower()
+    return any(marker in lower for marker in _PI_REASONING_MODEL_MARKERS)
+
+
+def _databricks_gateway_pi_provider(
+    *,
+    anthropic_base_url: str,
+    openai_base_url: str | None,
+    model: str | None,
+    api_key: str,
+) -> PiProviderConfig:
+    """Build a family-aware Pi provider for a Databricks AI Gateway.
+
+    The gateway serves Claude on the Anthropic Messages surface and non-Claude
+    models (GLM, Gemini, DeepSeek, …) on the OpenAI-compatible serving-endpoints
+    surface. The old code hardcoded ``anthropic-messages`` for every model, so a
+    non-Claude selection hung on the Anthropic surface (#2575). Route by the
+    resolved model's family:
+
+    * Both surfaces are registered whenever the gateway exposes them, so Pi's
+      ``/model`` picker offers every family regardless of the launch model. The
+      *launched* (primary) provider is chosen by the resolved model's family:
+      Claude → Anthropic Messages; non-Claude → OpenAI-completions on
+      serving-endpoints (with the Databricks ``compat`` flags; ``reasoning`` is
+      derived per model id). The other family rides along as a launch-inert
+      companion, each provider carrying its family catalog for discovery.
+
+    When *openai_base_url* is ``None`` the gateway shape exposes no reachable
+    serving-endpoints surface (today: the cli-config ai-gateway subdomain, whose
+    workspace serving-endpoints host isn't safely derivable from that base URL).
+    A non-Claude selection then keeps the prior behavior — the resolved id is
+    sent to the Anthropic surface, where it errors loudly — rather than silently
+    swapping to a Claude model. Tracked as a #2575 follow-up.
+
+    :param anthropic_base_url: The gateway's Anthropic Messages base URL.
+    :param openai_base_url: The gateway's OpenAI-completions base URL, or
+        ``None`` when this gateway shape has no reachable one.
+    :param model: Session model override, or ``None`` to use the default.
+    :param api_key: The ``!command`` bearer-token apiKey (shared by both
+        surfaces of the same gateway).
+    :returns: The resolved family-aware Pi provider config.
+    """
+    resolved = model or _DATABRICKS_PI_DEFAULT_MODEL
+    resolved_is_claude = _is_claude_model(resolved)
+
+    # No reachable OpenAI-completions surface (today: cli-config's ai-gateway
+    # subdomain). Keep the prior single-provider Anthropic behavior — a
+    # non-Claude id is honored (and errors loud) rather than silently swapped.
+    if openai_base_url is None:
+        if not resolved_is_claude:
+            _LOGGER.warning(
+                "pi-native: non-Claude model %r selected on a Databricks gateway with no "
+                "reachable OpenAI-completions surface; Pi will use the Anthropic surface "
+                "(unsupported for this model). Tracked as a #2575 follow-up.",
+                resolved,
+            )
+        return PiProviderConfig(
+            provider_id=_PI_PROVIDER_ID,
+            base_url=anthropic_base_url,
+            api="anthropic-messages",
+            model=resolved,
+            api_key=api_key,
+            auth_header=True,
+        )
+
+    # Both surfaces reachable: register BOTH so Pi's /model picker offers every
+    # family no matter which one this session launches with. The launched
+    # (primary) provider is chosen by the resolved model's family; the other is
+    # a launch-inert companion. Each provider carries its family catalog
+    # (``_render_block`` appends the launch model when it's outside the list) —
+    # the shared curated lists from ``onboarding.databricks_config``, so the
+    # same ids and metadata (contextWindow / maxTokens / display name / image
+    # input) the in-process harness renders.
+    anthropic_model = resolved if resolved_is_claude else _DATABRICKS_PI_DEFAULT_MODEL
+    anthropic = PiProviderConfig(
+        provider_id=_PI_PROVIDER_ID,
+        base_url=anthropic_base_url,
+        api="anthropic-messages",
+        model=anthropic_model,
+        api_key=api_key,
+        auth_header=True,
+        image_input=True,
+        catalog=tuple(DATABRICKS_ANTHROPIC_MODELS),
+    )
+    openai_model = resolved if not resolved_is_claude else _DATABRICKS_PI_OPENAI_DEFAULT_MODEL
+    openai = PiProviderConfig(
+        provider_id=_PI_OPENAI_PROVIDER_ID,
+        base_url=openai_base_url,
+        api="openai-completions",
+        model=openai_model,
+        api_key=api_key,
+        auth_header=False,
+        compat=_DATABRICKS_OPENAI_COMPAT,
+        image_input=True,
+        reasoning=True,
+        catalog=(*DATABRICKS_GPT_MODELS, *_DATABRICKS_PI_EXTRA_COMPLETIONS_MODELS),
+    )
+    if resolved_is_claude:
+        return replace(anthropic, companions=(openai,))
+    return replace(openai, companions=(anthropic,))
 
 
 def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiProviderConfig | None:
@@ -177,16 +411,16 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
         return None
     host = host.rstrip("/")
     auth_command = _databricks_codex_auth_command(host, entry.profile)
-    return PiProviderConfig(
-        provider_id=_PI_PROVIDER_ID,
-        base_url=f"{host}{_DATABRICKS_ANTHROPIC_GATEWAY_PATH}",
-        api="anthropic-messages",
-        model=model or _DATABRICKS_PI_DEFAULT_MODEL,
-        # Pi resolves a "!command" apiKey at request time, so the gateway
-        # bearer token is refreshed per request (the auth command itself
-        # force-refreshes), matching codex-native's refresh semantics.
+    # Pi resolves a "!command" apiKey at request time, so the gateway bearer
+    # token is refreshed per request (the auth command itself force-refreshes),
+    # matching codex-native's refresh semantics. The ``databricks`` kind knows
+    # the workspace host, so both the Anthropic (/ai-gateway/anthropic) and the
+    # OpenAI-completions (/serving-endpoints) surfaces are reachable.
+    return _databricks_gateway_pi_provider(
+        anthropic_base_url=f"{host}{_DATABRICKS_ANTHROPIC_GATEWAY_PATH}",
+        openai_base_url=f"{host}{_DATABRICKS_SERVING_ENDPOINTS_PATH}",
+        model=model,
         api_key=f"!{auth_command}",
-        auth_header=True,
     )
 
 
@@ -318,16 +552,18 @@ def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
     transport = _cli_config_databricks_transport(entry)
     if transport is None:
         return None
-    return PiProviderConfig(
-        provider_id=_PI_PROVIDER_ID,
-        base_url=_gateway_anthropic_base_url(transport.base_url),
-        api="anthropic-messages",
-        model=model or _DATABRICKS_PI_DEFAULT_MODEL,
-        # Pi resolves a "!command" apiKey at request time, so the gateway
-        # bearer token (the codex auth command prints it) is refreshed per
-        # request — matching codex-native's refresh semantics.
+    # Pi resolves a "!command" apiKey at request time, so the gateway bearer
+    # token (the codex auth command prints it) is refreshed per request —
+    # matching codex-native's refresh semantics. ``openai_base_url=None``: the
+    # cli-config gateway is the ai-gateway *subdomain*, whose OpenAI
+    # serving-endpoints host isn't safely derivable from that base URL, so
+    # non-Claude routing is deferred (a #2575 follow-up). Claude is unaffected —
+    # it uses the Anthropic surface either way.
+    return _databricks_gateway_pi_provider(
+        anthropic_base_url=_gateway_anthropic_base_url(transport.base_url),
+        openai_base_url=None,
+        model=model,
         api_key=f"!{transport.auth_command}",
-        auth_header=True,
     )
 
 

@@ -50,7 +50,11 @@ from urllib.parse import urlparse as _urlparse
 
 from omnigent.inner.native_attachments import parse_data_uri
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
-from omnigent.onboarding.databricks_config import DATABRICKS_CLAUDE_DEFAULT_MODEL
+from omnigent.onboarding.databricks_config import (
+    DATABRICKS_ANTHROPIC_MODELS,
+    DATABRICKS_CLAUDE_DEFAULT_MODEL,
+    DATABRICKS_GPT_MODELS,
+)
 from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
 from omnigent.spec.types import RetryPolicy
 
@@ -554,71 +558,10 @@ def _find_pi_cli() -> str | None:
 # override these provider URLs; the host-derived defaults remain for legacy
 # profile-only usage.
 
-# Each static entry declares ``input: ["text", "image"]`` for the same reason
-# the dynamic-registration path does (see _build_models_json): Pi's
-# transformMessages strips image blocks unless the model entry advertises
-# image input. These are all vision-capable models, and the run model is often
-# a static id — in which case _build_models_json's append is skipped, so the
-# capability has to be declared here too or attached images are silently
-# dropped (#515/#516).
-_DATABRICKS_RESPONSES_MODELS = [
-    {
-        "id": "databricks-gpt-5-4-mini",
-        "name": "GPT-5.4 Mini",
-        "contextWindow": 1047576,
-        "maxTokens": 32768,
-        "input": ["text", "image"],
-    },
-    {
-        "id": "databricks-gpt-5-4",
-        "name": "GPT-5.4",
-        "contextWindow": 1047576,
-        "maxTokens": 32768,
-        "input": ["text", "image"],
-    },
-    {
-        "id": "databricks-gpt-5-5",
-        "name": "GPT-5.5",
-        # OSS profile endpoint metadata: 400K total context, 128K max output.
-        "contextWindow": 400000,
-        "maxTokens": 128000,
-        "input": ["text", "image"],
-    },
-    {
-        "id": "databricks-gpt-5-5-pro",
-        "name": "GPT-5.5 Pro",
-        # OSS profile endpoint metadata: 400K total context, 128K max output.
-        "contextWindow": 400000,
-        "maxTokens": 128000,
-        "input": ["text", "image"],
-    },
-]
-
-_DATABRICKS_ANTHROPIC_MODELS = [
-    {
-        "id": "databricks-claude-opus-4-8",
-        "name": "Claude Opus 4.8",
-        # Gateway-verified caps: >1000000 input rejects, 128001+ output rejects.
-        "contextWindow": 1000000,
-        "maxTokens": 128000,
-        "input": ["text", "image"],
-    },
-    {
-        "id": "databricks-claude-sonnet-4-6",
-        "name": "Claude Sonnet 4.6",
-        "contextWindow": 1000000,
-        "maxTokens": 128000,
-        "input": ["text", "image"],
-    },
-    {
-        "id": "databricks-claude-sonnet-4-5",
-        "name": "Claude Sonnet 4.5",
-        # Gateway rejects this model past ~200k input.
-        "contextWindow": 200000,
-        "maxTokens": 16384,
-        "input": ["text", "image"],
-    },
-]
+# The static GPT / Claude catalogs live in their shared home,
+# ``omnigent.onboarding.databricks_config`` (``DATABRICKS_GPT_MODELS`` /
+# ``DATABRICKS_ANTHROPIC_MODELS``, imported above) — single source of truth
+# with the interactive pi-native path (``pi_native_credentials``).
 
 # Empty: the only listed endpoint (meta-llama-3.3-70b) no longer exists on
 # the gateway. The provider stays so non-Claude/GPT ids keep a routing home.
@@ -767,7 +710,7 @@ def _build_models_json(
                     "supportsStrictMode": False,
                     "supportsReasoningEffort": False,
                 },
-                "models": _DATABRICKS_RESPONSES_MODELS,
+                "models": DATABRICKS_GPT_MODELS,
             },
             # Claude models → Anthropic Messages API.
             # ``authHeader`` sends ``Authorization: Bearer <token>`` instead
@@ -777,7 +720,7 @@ def _build_models_json(
                 "apiKey": token,
                 "api": "anthropic-messages",
                 "authHeader": True,
-                "models": _DATABRICKS_ANTHROPIC_MODELS,
+                "models": DATABRICKS_ANTHROPIC_MODELS,
             },
             # Everything else (Llama, etc.) → same endpoint, same API
             "databricks-completions": {

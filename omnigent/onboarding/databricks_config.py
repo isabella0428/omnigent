@@ -6,6 +6,7 @@ import configparser
 import importlib.util
 import logging
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 _logger = logging.getLogger(__name__)
@@ -83,6 +84,80 @@ def databricks_sdk_installed() -> bool:
 # endpoint name — the gateway rejects Anthropic-direct ids like the CLI's
 # own ``opus[1m]`` default.
 DATABRICKS_CLAUDE_DEFAULT_MODEL = "databricks-claude-opus-4-8"
+
+
+# Static Databricks-gateway model catalogs, in Pi ``models.json`` entry shape.
+# Shared home (single source of truth) for the two consumers that render them:
+# the in-process harness (``inner/pi_executor._build_models_json``) and the
+# interactive pi-native path (``pi_native_credentials``). This module stays
+# stdlib-light on purpose — ``pi_native_credentials`` imports it on the
+# runner's session-create hot path.
+#
+# Each static entry declares ``input: ["text", "image"]`` for the same reason
+# the dynamic-registration path does (see _build_models_json): Pi's
+# transformMessages strips image blocks unless the model entry advertises
+# image input. These are all vision-capable models, and the run model is often
+# a static id — in which case _build_models_json's append is skipped, so the
+# capability has to be declared here too or attached images are silently
+# dropped (#515/#516).
+DATABRICKS_GPT_MODELS: list[dict[str, Any]] = [
+    {
+        "id": "databricks-gpt-5-4-mini",
+        "name": "GPT-5.4 Mini",
+        "contextWindow": 1047576,
+        "maxTokens": 32768,
+        "input": ["text", "image"],
+    },
+    {
+        "id": "databricks-gpt-5-4",
+        "name": "GPT-5.4",
+        "contextWindow": 1047576,
+        "maxTokens": 32768,
+        "input": ["text", "image"],
+    },
+    {
+        "id": "databricks-gpt-5-5",
+        "name": "GPT-5.5",
+        # OSS profile endpoint metadata: 400K total context, 128K max output.
+        "contextWindow": 400000,
+        "maxTokens": 128000,
+        "input": ["text", "image"],
+    },
+    {
+        "id": "databricks-gpt-5-5-pro",
+        "name": "GPT-5.5 Pro",
+        # OSS profile endpoint metadata: 400K total context, 128K max output.
+        "contextWindow": 400000,
+        "maxTokens": 128000,
+        "input": ["text", "image"],
+    },
+]
+
+DATABRICKS_ANTHROPIC_MODELS: list[dict[str, Any]] = [
+    {
+        "id": "databricks-claude-opus-4-8",
+        "name": "Claude Opus 4.8",
+        # Gateway-verified caps: >1000000 input rejects, 128001+ output rejects.
+        "contextWindow": 1000000,
+        "maxTokens": 128000,
+        "input": ["text", "image"],
+    },
+    {
+        "id": "databricks-claude-sonnet-4-6",
+        "name": "Claude Sonnet 4.6",
+        "contextWindow": 1000000,
+        "maxTokens": 128000,
+        "input": ["text", "image"],
+    },
+    {
+        "id": "databricks-claude-sonnet-4-5",
+        "name": "Claude Sonnet 4.5",
+        # Gateway rejects this model past ~200k input.
+        "contextWindow": 200000,
+        "maxTokens": 16384,
+        "input": ["text", "image"],
+    },
+]
 
 
 def list_databricks_profiles() -> list[str]:
