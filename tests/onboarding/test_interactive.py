@@ -464,3 +464,26 @@ def test_render_menu_compact_truncates_long_description_to_one_line() -> None:
     assert len(hint_lines) == 1
     assert "…" in hint_lines[0]
     assert len(hint_lines[0]) <= 40
+
+
+def test_select_degrades_to_fallback_when_termios_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On a TTY host lacking ``termios``, ``select`` degrades instead of crashing.
+    """
+    # Report a real terminal so select() reaches the termios/tty import instead
+    # of the non-TTY numbered branch.
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    # Emulate the Windows CPython build where these modules are absent: a
+    # ``None`` entry in ``sys.modules`` makes ``import <name>`` raise
+    # ``ImportError`` (``ModuleNotFoundError`` is the concrete subclass raised
+    # on real Windows), exercising the same degrade-to-fallback except clause.
+    monkeypatch.setitem(sys.modules, "termios", None)
+    monkeypatch.setitem(sys.modules, "tty", None)
+    _feed(monkeypatch, ["2"])
+
+    chosen = interactive.select("Which provider?", ["Claude", "Codex", "Quit"])
+
+    # "2" fed to the numbered fallback selects the second option (index 1),
+    # proving select() degraded cleanly instead of raising ModuleNotFoundError.
+    assert chosen == 1

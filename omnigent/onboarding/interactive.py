@@ -401,8 +401,17 @@ def select(
     if not sys.stdin.isatty():
         return _select_fallback(title, options, default=default, selectable=mask)
 
-    import termios
-    import tty
+    try:
+        import termios
+        import tty
+    except ImportError:
+        # ``termios``/``tty`` are POSIX-only stdlib modules — the CPython
+        # build on Windows is not compiled with them, so ``import termios``
+        # raises ``ModuleNotFoundError``. Without raw-mode keypress reading
+        # there is no arrow-key loop to drive, so degrade to the numbered
+        # prompt (the same fallback the non-TTY branch above uses) instead of
+        # crashing the whole ``omnigent setup`` flow. See issue #2993.
+        return _select_fallback(title, options, default=default, selectable=mask)
 
     fd = sys.stdin.fileno()
     selected = _first_selectable(mask, default)
