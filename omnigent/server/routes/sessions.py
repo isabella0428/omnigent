@@ -5777,6 +5777,8 @@ def create_sessions_router(
                     agent_store,
                     runner_router,
                     actor=_actor,
+                    file_store=file_store,
+                    artifact_store=artifact_store,
                 )
             except Exception as _policy_exc:  # noqa: BLE001 — fail-safe for misconfigured policies
                 # Policy evaluation crashed (e.g. factory misconfigured).
@@ -5826,6 +5828,8 @@ def create_sessions_router(
                 conversation_store,
                 agent_store,
                 runner_router,
+                file_store=file_store,
+                artifact_store=artifact_store,
             )
             if _input_verdict is not None:
                 reason = _input_verdict.get("reason", "Denied by policy")
