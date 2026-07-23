@@ -9956,9 +9956,7 @@ def test_resolve_native_codex_launch_no_provider_sets_login_fallback_summary(
     monkeypatch.setattr(provider_config, "load_config", dict)
     monkeypatch.setattr(detected, "codex_config_provider_dismissed", lambda cfg: False)
     monkeypatch.setattr(detected, "effective_config_with_detected", lambda cfg: {})
-    monkeypatch.setattr(
-        provider_config, "default_provider_for_harness", lambda cfg, harness: None
-    )
+    monkeypatch.setattr(provider_config, "default_provider_for_harness", lambda cfg, harness: None)
     monkeypatch.setattr(workflow, "_load_global_auth", lambda: None)
 
     launch = codex_native_app_server.resolve_native_codex_launch(model=None)

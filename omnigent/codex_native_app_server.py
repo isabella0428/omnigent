@@ -1365,8 +1365,7 @@ def _codex_provider_launch(entry: ProviderEntry, model: str | None) -> NativeCod
             model=model,
             profile=None,
             summary=(
-                f"provider {entry.name!r} via cli-config "
-                f"(model_provider={entry.model_provider!r})"
+                f"provider {entry.name!r} via cli-config (model_provider={entry.model_provider!r})"
             ),
         )
     if entry.kind not in (KEY_KIND, GATEWAY_KIND, LOCAL_KIND):
