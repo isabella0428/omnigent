@@ -6990,8 +6990,8 @@ _CONTEXT_OVERFLOW_REPLACEMENT = (
 # Claude Code points its auth failures at ``/login`` — a dead end in the
 # web chat, where ``/login`` is a dropped command: it is escaped into
 # plain text and answered by the same expired session with the same
-# line. These rewrites send the user to ``omni setup`` on the host,
-# which does re-authenticate.
+# line. These records get guidance APPENDED sending the user to
+# ``omni setup`` on the host, which does re-authenticate.
 #
 # The strings are hardcoded constants in the CLI binary (read out of
 # @anthropic-ai/claude-code 2.1.212), and there is more than one shape:
@@ -7003,17 +7003,20 @@ _CONTEXT_OVERFLOW_REPLACEMENT = (
 #
 # so the instruction is not always the trailing clause and is not always
 # spelled "Please run". Rather than edit inside a sentence whose shape
-# the next CLI release may change, the whole message is replaced — the
-# same treatment _CONTEXT_OVERFLOW_REPLACEMENT above gives "prompt is
-# too long". Every one of these strings has the same remedy, so the
-# lost detail costs the user nothing actionable.
+# the next CLI release may change, the guidance is appended below the
+# CLI's own text. Appending, not replacing: some variants carry a
+# remedy beyond re-auth ("If CLAUDE_CODE_OAUTH_TOKEN is set, unset it
+# or re-mint it ... then /logout and /login.", "Credit balance too low
+# · Run /login to switch accounts") and wholesale replacement would
+# delete the only instruction that fixes them, stranding the user with
+# advice for a different problem.
 #
 # Matching the bare token anywhere in the message is only safe because
 # it is paired with :func:`_is_api_error_entry`: a flagged record is not
-# model output, so there is no prose to damage. An UNFLAGGED record is
-# never rewritten, however much it looks like the error — replacing a
-# real model turn that merely mentions /login would delete an answer the
-# user wanted, which is worse than leaving the CLI's line on screen.
+# model output, so there is no prose to mislabel. An UNFLAGGED record is
+# never touched, however much it looks like the error — appending
+# remedy text to a real model turn that merely mentions /login would
+# misdirect the user, which is worse than leaving the CLI's line alone.
 #
 # The lookbehind keeps paths and URLs out (``a/login``, ``//login``,
 # ``https://host/login``); ``\b`` keeps ``/loginfoo`` out while still
@@ -7026,12 +7029,15 @@ _CONTEXT_OVERFLOW_REPLACEMENT = (
 # sessions; /logout here has no effect." Those describe a DIFFERENT
 # failure (an env var or another session overriding the credential)
 # whose remedy is unsetting that variable — something ``omni setup``
-# does not do. Replacing them would delete the only instruction that
-# fixes them. The one shape worth catching, "...then /logout and
-# /login.", already matches on its ``/login``.
+# does not do, so pointing at it there would only add noise. The one
+# shape worth catching, "...then /logout and /login.", already matches
+# on its ``/login``.
 _LOGIN_COMMAND_RE = re.compile(r"(?<![\w/])/login\b")
 
-_LOGIN_REPLACEMENT = "Login expired · Run `omni setup` on the host to sign in again"
+_LOGIN_GUIDANCE = (
+    "`/login` is not available from the Omnigent web chat — run "
+    "`omni setup` on the host to sign in again."
+)
 
 
 def _is_api_error_entry(entry: _JsonObject) -> bool:
@@ -7075,8 +7081,9 @@ def _assistant_message_item(
     :param response_id: Response id grouping the Claude turn.
     :param text: Assistant text block.
     :param is_api_error: Whether Claude Code flagged the record as its
-        own API error (see :func:`_is_api_error_entry`). Widens the
-        ``/login`` rewrite, which is safe only on CLI-authored text.
+        own API error (see :func:`_is_api_error_entry`). Gates the
+        ``/login`` guidance append, which is safe only on CLI-authored
+        text.
     :returns: Parsed transcript item.
     """
     display_text = text
@@ -7084,7 +7091,7 @@ def _assistant_message_item(
     if _CONTEXT_OVERFLOW_RE.match(stripped):
         display_text = _CONTEXT_OVERFLOW_REPLACEMENT
     elif is_api_error and _LOGIN_COMMAND_RE.search(stripped):
-        display_text = _LOGIN_REPLACEMENT
+        display_text = f"{text.rstrip()}\n\n{_LOGIN_GUIDANCE}"
     return ClaudeTranscriptItem(
         source_id=_source_id(source_key, item_index, "message"),
         item_type="message",

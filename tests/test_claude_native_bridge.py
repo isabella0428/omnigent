@@ -32,7 +32,7 @@ from omnigent.harnesses.claude_native.bridge import (
     _escape_unsupported_slash_command,
     _hook_record_from_jsonl_record,
     _JsonlRecord,
-    _LOGIN_REPLACEMENT,
+    _LOGIN_GUIDANCE,
     _occupying_surface,
     augment_claude_args,
     count_hook_events,
@@ -1256,11 +1256,12 @@ def test_read_transcript_leaves_unflagged_login_text_untouched(
     raw_text: str,
 ) -> None:
     """
-    Only a CLI-flagged record is rewritten, never an unflagged one.
+    Only a CLI-flagged record gets the guidance, never an unflagged one.
 
-    The rewrite replaces the WHOLE message, so a false positive costs
-    the user a real answer. ``isApiErrorMessage`` is the only evidence
-    that the text is not model output; without it, nothing is touched.
+    Appending remedy text to a real model answer that merely mentions
+    ``/login`` would misdirect the user. ``isApiErrorMessage`` is the
+    only evidence that the text is not model output; without it,
+    nothing is touched.
     """
     assert _assistant_transcript_text(tmp_path, raw_text) == raw_text
 
@@ -1282,15 +1283,17 @@ def test_read_transcript_rewrites_flagged_api_error_anywhere(
     raw_text: str,
 ) -> None:
     """
-    A CLI-flagged record is replaced wherever its ``/login`` sits.
+    A CLI-flagged record gets guidance appended wherever its ``/login`` sits.
 
     ``isApiErrorMessage`` is Claude Code's own marker for a record it
     synthesized instead of receiving from the model — an expired login
     never reaches the API, so there is no model turn behind the text.
     That makes a wider match safe, which is what catches the auth
-    strings whose instruction sits mid-sentence.
+    strings whose instruction sits mid-sentence. The CLI's own text is
+    kept: variants whose remedy goes beyond re-auth must not lose it.
     """
-    assert _assistant_transcript_text(tmp_path, raw_text, is_api_error=True) == _LOGIN_REPLACEMENT
+    expected = f"{raw_text}\n\n{_LOGIN_GUIDANCE}"
+    assert _assistant_transcript_text(tmp_path, raw_text, is_api_error=True) == expected
 
 
 def test_read_transcript_flag_inside_message_also_counts(tmp_path: Path) -> None:
@@ -1319,7 +1322,11 @@ def test_read_transcript_flag_inside_message_also_counts(tmp_path: Path) -> None
 
     _, _, items = read_transcript_items_since(transcript_path, 0, agent_name="claude-native-ui")
 
-    assert "omni setup" in items[0].data["content"][0]["text"]
+    rendered = items[0].data["content"][0]["text"]
+    assert "omni setup" in rendered
+    # The CLI's own diagnosis (a billing problem, not an expired login)
+    # must survive: the guidance is appended, never a replacement.
+    assert rendered.startswith("Credit balance too low · Run /login to switch accounts")
 
 
 @pytest.mark.parametrize(
@@ -1329,7 +1336,7 @@ def test_read_transcript_flag_inside_message_also_counts(tmp_path: Path) -> None
         "API Error: 500 Internal Server Error",
         # Auth errors that name /logout ALONE (verbatim from the binary).
         # Their remedy is unsetting an env var, which `omni setup` does
-        # not do — replacing them would delete the only fix they carry.
+        # not do — appending its guidance there would only add noise.
         "ANTHROPIC_API_KEY is set · unset it or /logout to clear the saved key",
         "Unset the ANTHROPIC_API_KEY environment variable, or claude /logout then say continue",
         "This background session shares credentials with other sessions; /logout here has "
@@ -1358,15 +1365,19 @@ def test_read_transcript_rewrites_logout_and_login_together(tmp_path: Path) -> N
     """
     A message naming BOTH commands is still a ``/login`` dead end.
 
-    The CLI's "...then /logout and /login." shape is a re-auth
-    instruction, so it takes the rewrite via its ``/login``.
+    The CLI's "...then /logout and /login." shape ends in a re-auth
+    instruction, so it takes the guidance via its ``/login`` — but its
+    env-var prerequisite (unset or re-mint ``CLAUDE_CODE_OAUTH_TOKEN``,
+    which ``omni setup`` cannot do) must stay on screen, so the CLI
+    text is kept and the guidance appended below it.
     """
     raw_text = (
         "If CLAUDE_CODE_OAUTH_TOKEN is set, unset it or re-mint it for this "
         "account, then /logout and /login."
     )
 
-    assert _assistant_transcript_text(tmp_path, raw_text, is_api_error=True) == _LOGIN_REPLACEMENT
+    expected = f"{raw_text}\n\n{_LOGIN_GUIDANCE}"
+    assert _assistant_transcript_text(tmp_path, raw_text, is_api_error=True) == expected
 
 
 def test_read_transcript_items_from_offset_skips_existing_prefix(

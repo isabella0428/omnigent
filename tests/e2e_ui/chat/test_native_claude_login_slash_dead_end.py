@@ -3,7 +3,7 @@ r"""E2E: ``/login`` from web chat on a claude-native session with an expired log
 On a claude-native session whose Claude Code login has expired, every web
 turn answers ``Login expired · Please run /login`` — and typing ``/login``
 in the composer cannot fix it, because ``/login`` is in
-``_CLAUDE_CLI_DROPPED_COMMANDS`` (``omnigent/claude_native_bridge.py``) and
+``_CLAUDE_CLI_DROPPED_COMMANDS`` (``omnigent/harnesses/claude_native/bridge.py``) and
 not in ``_CLAUDE_NATIVE_ALLOWED_USER_SLASH_COMMANDS``, so
 ``_escape_unsupported_slash_command`` prefixes it with U+FEFF and Claude
 Code receives it as ordinary prose. The CLI then answers it like any other
