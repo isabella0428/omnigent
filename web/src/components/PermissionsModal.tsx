@@ -15,6 +15,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { CheckIcon, LinkIcon, QrCodeIcon, Trash2Icon, UserPlusIcon } from "lucide-react";
 import { QRCodeSVG } from "qrcode.react";
 import { Button } from "@/components/ui/button";
@@ -41,9 +42,12 @@ import {
   usePermissions,
   useRevokePermission,
 } from "@/hooks/usePermissions";
+import { useSession } from "@/hooks/useSession";
 import { useUserSearch } from "@/hooks/useUserSearch";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { updateSession } from "@/lib/sessionsApi";
 import { getOmnigentTransformShareLink, getOmnigentUserSearch } from "@/lib/host";
+import { workspaceSharingBlocked } from "@/lib/permissionsApi";
 import { useRebasePath } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 
@@ -59,16 +63,16 @@ const LEVEL_LABELS: Record<number, string> = {
 
 interface PermissionsModalProps {
   sessionId: string;
+  workspace?: string | null;
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  canDelegateApprovals?: boolean;
 }
 
 export function PermissionsModal({
   sessionId,
+  workspace,
   open,
   onOpenChange,
-  canDelegateApprovals = false,
 }: PermissionsModalProps) {
   // Server sharing policy. While the boot probe is in flight we treat the
   // server as "on" (fail open) so the modal renders its full controls; the
@@ -76,11 +80,9 @@ export function PermissionsModal({
   const info = useServerInfo();
   const sharingMode = info === "loading" ? "on" : info.sharing_mode;
   const sharingOff = sharingMode === "off";
-  // Both read-capped tiers present the read-only UI. Under
-  // "restricted_read_only" the server additionally blocks home/root-cwd
-  // sessions entirely; that per-session rule is enforced server-side and
-  // surfaces here as an error on the grant attempt.
   const sharingReadOnly = sharingMode === "read_only" || sharingMode === "restricted_read_only";
+  const workspaceBlocked =
+    sharingMode === "restricted_read_only" && workspaceSharingBlocked(workspace);
   // Public (anyone-with-the-link) access is a separate server switch from the
   // sharing tiers; when off, hide the toggle (the server rejects the grant too).
   const publicSharingEnabled = info === "loading" ? true : info.public_sharing_enabled;
@@ -96,6 +98,23 @@ export function PermissionsModal({
   const [error, setError] = useState<string | null>(null);
   const [showQr, setShowQr] = useState(false);
 
+  // Whether the owner shared the workspace files with view-level collaborators.
+  // Read from the (shared-cache) session snapshot; the toggle PATCHes it and
+  // invalidates the snapshot so the rail's file surfaces appear/disappear.
+  const { session } = useSession(open && !sharingOff ? sessionId : null);
+  const queryClient = useQueryClient();
+  const shareWorkspace = useMutation({
+    mutationFn: (next: boolean) => updateSession(sessionId, { shareWorkspaceFiles: next }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["session", sessionId] });
+    },
+    onError: (err: Error) => setError(err.message),
+  });
+  // Only a session with a workspace on disk has files to share; a plain
+  // chat agent has none, so the toggle would be inert — hide it there.
+  const hasWorkspace = !!session?.workspace;
+  const workspaceShared = session?.shareWorkspaceFiles ?? false;
+
   const userGrants = (permissions ?? []).filter((p) => p.user_id !== PUBLIC_USER);
   const publicGrant = (permissions ?? []).find((p) => p.user_id === PUBLIC_USER);
   const isPublic = !!publicGrant;
@@ -103,11 +122,10 @@ export function PermissionsModal({
   function handleGrant(e: FormEvent) {
     e.preventDefault();
     const trimmed = newUserId.trim();
-    if (!trimmed) return;
+    if (!trimmed || workspaceBlocked) return;
     setError(null);
-    const canApprove = newLevel === "2-approve";
     grant.mutate(
-      { userId: trimmed, level: canApprove ? 2 : parseInt(newLevel, 10), canApprove },
+      { userId: trimmed, level: parseInt(newLevel, 10) },
       {
         onSuccess: () => {
           setNewUserId("");
@@ -125,12 +143,14 @@ export function PermissionsModal({
     });
   }
 
-  function handleChangeLevel(userId: string, level: number, canApprove: boolean) {
+  function handleChangeLevel(userId: string, level: number) {
+    if (workspaceBlocked) return;
     setError(null);
-    grant.mutate({ userId, level, canApprove }, { onError: (err) => setError(err.message) });
+    grant.mutate({ userId, level }, { onError: (err) => setError(err.message) });
   }
 
   function handlePublicToggle(checked: boolean) {
+    if (checked && workspaceBlocked) return;
     setError(null);
     if (checked) {
       grant.mutate({ userId: PUBLIC_USER, level: 1 }, { onError: (err) => setError(err.message) });
@@ -168,10 +188,20 @@ export function PermissionsModal({
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">Share this session</DialogTitle>
-          <DialogDescription>
-            {sharingReadOnly
-              ? "This server allows read-only sharing — invite others to view this session."
-              : "Invite others to view or collaborate on this session."}
+          <DialogDescription asChild>
+            <div className="space-y-3">
+              <p>
+                {sharingReadOnly
+                  ? "This server allows read-only sharing — invite others to view this session."
+                  : "Invite others to view or collaborate on this session."}
+              </p>
+              {sharingReadOnly && (
+                <p>
+                  Please be careful when sharing. Read access will allow for reading of all session
+                  outputs.
+                </p>
+              )}
+            </div>
           </DialogDescription>
         </DialogHeader>
 
@@ -185,7 +215,35 @@ export function PermissionsModal({
             <Switch
               checked={isPublic}
               onCheckedChange={handlePublicToggle}
-              disabled={grant.isPending || revoke.isPending}
+              disabled={grant.isPending || revoke.isPending || (workspaceBlocked && !isPublic)}
+              componentId="diagnostics.permissions.public_toggle"
+            />
+          </div>
+        )}
+
+        {/* Workspace-files toggle — off by default so a view-only share never
+            leaks the session's files (which routinely hold secrets). Only the
+            file surfaces open up; edit collaborators already have them. Shown
+            only for sessions that actually have a workspace on disk. */}
+        {hasWorkspace && (
+          <div
+            className="flex items-center justify-between rounded-lg border px-3 py-2"
+            data-testid="share-workspace-files"
+          >
+            <div>
+              <p className="text-ui font-medium">Workspace files</p>
+              <p className="text-sm text-muted-foreground">
+                Let people with view access browse this session's files
+              </p>
+            </div>
+            <Switch
+              checked={workspaceShared}
+              onCheckedChange={(checked) => {
+                setError(null);
+                shareWorkspace.mutate(checked);
+              }}
+              disabled={shareWorkspace.isPending}
+              componentId="diagnostics.permissions.share_workspace_toggle"
             />
           </div>
         )}
@@ -219,7 +277,6 @@ export function PermissionsModal({
                     onChangeLevel={handleChangeLevel}
                     busy={grant.isPending || revoke.isPending}
                     readOnly={sharingReadOnly}
-                    canDelegateApprovals={canDelegateApprovals}
                   />
                 ))}
               </div>
@@ -239,7 +296,12 @@ export function PermissionsModal({
             <label htmlFor="perm-level" className="text-sm font-medium text-muted-foreground">
               Level
             </label>
-            <Select value={newLevel} onValueChange={setNewLevel}>
+            <Select
+              value={newLevel}
+              onValueChange={setNewLevel}
+              componentId="diagnostics.permissions.grant_level"
+              valueHasNoPii
+            >
               <SelectTrigger className="mt-1 w-24">
                 <SelectValue />
               </SelectTrigger>
@@ -247,21 +309,25 @@ export function PermissionsModal({
                 <SelectItem value="1">Read</SelectItem>
                 {/* Read-only sharing caps new grants at view; hide Edit. */}
                 {!sharingReadOnly && <SelectItem value="2">Edit</SelectItem>}
-                {!sharingReadOnly && canDelegateApprovals && (
-                  <SelectItem value="2-approve">Edit + approve</SelectItem>
-                )}
               </SelectContent>
             </Select>
           </div>
-          <Button type="submit" size="sm" disabled={!newUserId.trim() || grant.isPending}>
+          <Button
+            type="submit"
+            size="sm"
+            loading={grant.isPending}
+            disabled={!newUserId.trim()}
+            componentId="diagnostics.permissions.grant"
+          >
             <UserPlusIcon className="mr-1 size-3.5" />
             Grant
           </Button>
         </form>
 
-        {canDelegateApprovals && !sharingReadOnly && (
-          <p className="text-sm text-muted-foreground">
-            Approvers can authorize actions that use your session credentials.
+        {workspaceBlocked && (
+          <p className="text-sm text-destructive">
+            This session&apos;s working directory (a home or root directory) cannot be shared on
+            this Omnigent server.
           </p>
         )}
 
@@ -516,7 +582,13 @@ function CopyLinkButton({ sessionId }: { sessionId: string }) {
   }, [sessionId, rebasePath]);
 
   return (
-    <Button variant="ghost" size="sm" onClick={handleCopy} className="gap-1.5 text-primary">
+    <Button
+      variant="ghost"
+      size="sm"
+      onClick={handleCopy}
+      className="gap-1.5 text-primary"
+      componentId="diagnostics.permissions.copy_link"
+    >
       {copied ? <CheckIcon className="size-3.5" /> : <LinkIcon className="size-3.5" />}
       {copied ? "Copied!" : "Copy link"}
     </Button>
@@ -585,14 +657,12 @@ function GrantRow({
   onChangeLevel,
   busy,
   readOnly,
-  canDelegateApprovals,
 }: {
   permission: Permission;
   onRevoke: (userId: string) => void;
-  onChangeLevel: (userId: string, level: number, canApprove: boolean) => void;
+  onChangeLevel: (userId: string, level: number) => void;
   busy: boolean;
   readOnly: boolean;
-  canDelegateApprovals: boolean;
 }) {
   const isOwner = permission.level === 4;
   // Manage is not grantable from the UI, so a pre-existing manage grant
@@ -601,10 +671,7 @@ function GrantRow({
   const isManage = permission.level === 3;
   // Read-only sharing mode: existing grants can't be re-leveled, so the level
   // shows as a fixed label (like owner/manage) — but the row stays revocable.
-  const fixedLevel =
-    isOwner || isManage || readOnly || (permission.can_approve && !canDelegateApprovals);
-  const baseLevelLabel = LEVEL_LABELS[permission.level] ?? "Read";
-  const levelLabel = permission.can_approve ? `${baseLevelLabel} + approve` : baseLevelLabel;
+  const fixedLevel = isOwner || isManage || readOnly;
 
   return (
     <div className="flex items-center gap-2 rounded-md px-2 py-0.5 hover:bg-muted/50">
@@ -616,15 +683,12 @@ function GrantRow({
       </span>
       {fixedLevel ? (
         <span className="flex h-8 w-28 items-center px-3 text-ui text-muted-foreground">
-          {levelLabel}
+          {LEVEL_LABELS[permission.level] ?? "Read"}
         </span>
       ) : (
         <Select
-          value={permission.can_approve ? "2-approve" : String(permission.level)}
-          onValueChange={(value) => {
-            const canApprove = value === "2-approve";
-            onChangeLevel(permission.user_id, canApprove ? 2 : parseInt(value, 10), canApprove);
-          }}
+          value={String(permission.level)}
+          onValueChange={(v) => onChangeLevel(permission.user_id, parseInt(v, 10))}
           disabled={busy}
         >
           <SelectTrigger
@@ -636,7 +700,6 @@ function GrantRow({
           <SelectContent>
             <SelectItem value="1">Read</SelectItem>
             <SelectItem value="2">Edit</SelectItem>
-            {canDelegateApprovals && <SelectItem value="2-approve">Edit + approve</SelectItem>}
           </SelectContent>
         </Select>
       )}
@@ -649,6 +712,7 @@ function GrantRow({
           onClick={() => onRevoke(permission.user_id)}
           disabled={busy}
           className="shrink-0 text-muted-foreground hover:text-destructive"
+          componentId="diagnostics.permissions.revoke"
         >
           <Trash2Icon className="size-3.5" />
           <span className="sr-only">Revoke</span>

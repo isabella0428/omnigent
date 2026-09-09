@@ -1,6 +1,6 @@
 """
 Tests for the codex-native forwarder's model-change sync-back
-(:mod:`omnigent.codex_native_forwarder`).
+(:mod:`omnigent.harnesses.codex_native.forwarder`).
 
 For codex-native, ``config.toml``'s ``model`` key is the cost-policy source
 of truth (it is what an in-TUI ``/model`` writes). At subscription and at
@@ -15,20 +15,21 @@ only an already-mirrored value is not re-posted.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
 
-from omnigent import codex_native_forwarder as fwd
-from omnigent.codex_native_bridge import (
+from omnigent.harnesses.codex_native import forwarder as fwd
+from omnigent.harnesses.codex_native.bridge import (
     CodexNativeBridgeState,
     codex_home_for_bridge_dir,
     read_bridge_state,
     write_bridge_state,
 )
-from omnigent.codex_native_forwarder import _persist_codex_compaction_item
+from omnigent.harnesses.codex_native.forwarder import _persist_codex_compaction_item
 
 
 class _RecordingClient:
@@ -208,7 +209,7 @@ def test_refresh_launch_race_ends_on_routed_model(tmp_path: Path) -> None:
     ``turn/started`` re-read must adopt the routed model — with or without
     the mirror write having succeeded.
     """
-    from omnigent.codex_native_bridge import write_codex_config_model
+    from omnigent.harnesses.codex_native.bridge import write_codex_config_model
 
     _write_codex_config(tmp_path, 'model = "databricks-gpt-5-5"\n')
     state = fwd._CodexForwarderState()
@@ -301,6 +302,56 @@ def test_thread_settings_updated_records_effort_and_collaboration_mode() -> None
     assert state.model == "gpt-5.4-codex"
     assert state.effort == "medium"
     assert state.collaboration_mode == "plan"
+
+
+def test_thread_settings_updated_records_approval_preset() -> None:
+    """
+    ``thread/settings/updated`` resolves the live ``/permissions`` preset.
+
+    A TUI approval change arrives here; the forwarder must map the approval
+    fields to a preset value so the sync helper can mirror it to the web
+    read-back label. If this regresses, a TUI-side switch never reaches the UI.
+    """
+    state = fwd._CodexForwarderState()
+
+    state.note_thread_settings_updated(
+        {
+            "threadSettings": {
+                "approvalPolicy": "never",
+                "approvalsReviewer": "user",
+                "sandboxPolicy": {"type": "dangerFullAccess"},
+                "activePermissionProfile": {"id": ":danger-full-access", "extends": None},
+            }
+        }
+    )
+
+    assert state.approval_preset == "full-access"
+
+
+@pytest.mark.asyncio
+async def test_sync_codex_approval_mode_change_posts_preset_and_dedupes() -> None:
+    """
+    Codex ``/permissions`` changes mirror the runtime preset to Omnigent once.
+
+    The post must carry ``approval_mode`` so the server stamps the read-back
+    label + publishes; a second sync with the same preset must not re-post.
+    """
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState(approval_preset="read-only")
+
+    await fwd._sync_codex_approval_mode_change(client, session_id="conv_x", forwarder_state=state)
+    await fwd._sync_codex_approval_mode_change(client, session_id="conv_x", forwarder_state=state)
+
+    assert client.posts == [
+        (
+            "/v1/sessions/conv_x/events",
+            {
+                "type": "external_codex_approval_mode_change",
+                "data": {"approval_mode": "read-only"},
+            },
+        )
+    ]
+    assert state.posted_approval_preset == "read-only"
 
 
 @pytest.mark.asyncio
@@ -452,7 +503,10 @@ async def test_sync_codex_approval_mode_change_posts_and_dedupes() -> None:
                         'approval_policy="never"',
                         "-c",
                         'approvals_reviewer="auto_review"',
-                    ]
+                    ],
+                    # Same event now also carries the runtime preset (danger sandbox
+                    # → full-access) for the web read-back label.
+                    "approval_mode": "full-access",
                 },
             },
         )
@@ -465,6 +519,7 @@ async def test_sync_codex_approval_mode_change_posts_and_dedupes() -> None:
         "-c",
         'approvals_reviewer="auto_review"',
     ]
+    assert state.posted_approval_preset == "full-access"
 
 
 def test_codex_permission_settings_fall_back_to_legacy_policy_args() -> None:
@@ -1025,6 +1080,163 @@ def test_terminal_error_from_turn_prefers_turn_error_over_item() -> None:
     assert error.message == "from turn.error"
 
 
+def test_terminal_error_from_notification_reads_usage_limit() -> None:
+    """The standalone Codex ``error`` notification carries the visible reason."""
+    error = fwd._terminal_error_from_notification(
+        {
+            "threadId": "thread_123",
+            "turnId": "turn_123",
+            "willRetry": False,
+            "error": {
+                "message": "You've hit your usage limit.",
+                "codexErrorInfo": "usageLimitExceeded",
+            },
+        }
+    )
+
+    assert error is not None
+    assert error.message == "You've hit your usage limit."
+    assert error.kind == fwd._CODEX_ERROR_KIND_GENERIC
+
+
+@pytest.mark.asyncio
+async def test_handle_event_surfaces_non_retrying_error_notification(tmp_path: Path) -> None:
+    """A terminal standalone ``error`` notification reaches the session UI."""
+    client = _RecordingClient()
+
+    await fwd._handle_event(
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        event={
+            "method": "error",
+            "params": {
+                "threadId": "thread_123",
+                "turnId": "turn_123",
+                "willRetry": False,
+                "error": {
+                    "message": "You've hit your usage limit.",
+                    "codexErrorInfo": "usageLimitExceeded",
+                },
+            },
+        },
+        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+        expected_thread_id="thread_123",
+    )
+
+    assert client.posts == [
+        (
+            "/v1/sessions/conv_x/events",
+            {
+                "type": "external_session_status",
+                "data": {
+                    "status": "failed",
+                    "response_id": "codex_turn_123",
+                    "output": "You've hit your usage limit.",
+                },
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_handle_event_ignores_retrying_error_notification(tmp_path: Path) -> None:
+    """Retryable Codex errors remain internal while Codex retries the turn."""
+    client = _RecordingClient()
+
+    await fwd._handle_event(
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        event={
+            "method": "error",
+            "params": {
+                "threadId": "thread_123",
+                "turnId": "turn_123",
+                "willRetry": True,
+                "error": {"message": "connection dropped"},
+            },
+        },
+        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+        expected_thread_id="thread_123",
+    )
+
+    assert client.posts == []
+
+
+@pytest.mark.asyncio
+async def test_handle_event_deduplicates_error_then_terminal_boundary(tmp_path: Path) -> None:
+    """A standalone error owns the terminal status for its turn."""
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_x",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_123",
+        ),
+    )
+    client = _RecordingClient()
+    usage_coalescer = fwd._SessionUsageCoalescer(client, "conv_x")  # type: ignore[arg-type]
+    elicitation_tracker = fwd._CodexElicitationTaskTracker()
+    forwarder_state = fwd._CodexForwarderState()
+    error_event = {
+        "method": "error",
+        "params": {
+            "threadId": "thread_123",
+            "turnId": "turn_123",
+            "willRetry": False,
+            "error": {"message": "You've hit your usage limit."},
+        },
+    }
+
+    for event in (
+        error_event,
+        error_event,
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread_123",
+                "turn": {
+                    "id": "turn_123",
+                    "status": "completed",
+                    "items": [{"type": "agentMessage", "text": ""}],
+                },
+            },
+        },
+    ):
+        await fwd._handle_event(
+            client,  # type: ignore[arg-type]
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            event=event,
+            usage_coalescer=usage_coalescer,
+            elicitation_tracker=elicitation_tracker,
+            expected_thread_id="thread_123",
+            forwarder_state=forwarder_state,
+        )
+
+    assert client.posts == [
+        (
+            "/v1/sessions/conv_x/events",
+            {
+                "type": "external_session_status",
+                "data": {
+                    "status": "failed",
+                    "response_id": "codex_turn_123",
+                    "output": "You've hit your usage limit.",
+                },
+            },
+        )
+    ]
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id is None
+
+
 def test_terminal_error_from_turn_none_for_clean_turn() -> None:
     """A turn with no ``error`` object or item yields ``None`` (no false positives)."""
     params = {
@@ -1163,7 +1375,7 @@ def test_terminal_turn_status_edge_empty_turn_idle_and_warns(
     _seed_active_turn(tmp_path, "turn_123")
     params = {"turn": {"id": "turn_123", "status": "completed", "items": []}}
 
-    with caplog.at_level("WARNING", logger="omnigent.codex_native_forwarder"):
+    with caplog.at_level("WARNING", logger="omnigent.harnesses.codex_native.forwarder"):
         edge = fwd._terminal_turn_status_edge(tmp_path, "turn/completed", params)
 
     assert edge is not None
@@ -1451,8 +1663,42 @@ async def test_reasoning_delta_skips_empty_non_opening_delta() -> None:
 
 
 @pytest.mark.asyncio
-async def test_persist_codex_compaction_item_posts_event() -> None:
-    """Compaction event is posted with last_item_id and Codex summary."""
+async def test_persist_codex_compaction_item_posts_uuid_window_id(tmp_path: Path) -> None:
+    """Codex's UUID window id is posted with the compaction checkpoint."""
+    import json as _json
+
+    codex_home = codex_home_for_bridge_dir(tmp_path)
+    rollout = codex_home / "sessions" / "2026" / "09" / "05" / "rollout-thread_1.jsonl"
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text(
+        _json.dumps(
+            {
+                "type": "compacted",
+                "payload": {
+                    "replacement_history": [
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "hi"}],
+                        }
+                    ],
+                    "window_id": "01a070e2-2665-7d62-9b74-973decf239b7",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_codex",
+            socket_path="ws://127.0.0.1:9999",
+            thread_id="thread_1",
+            codex_home=str(codex_home),
+            cwd="/tmp/workspace",
+        ),
+    )
     get_resp = MagicMock()
     get_resp.json.return_value = {"data": [{"id": "item_codex"}]}
     get_resp.raise_for_status = MagicMock()
@@ -1464,7 +1710,11 @@ async def test_persist_codex_compaction_item_posts_event() -> None:
     post_resp.raise_for_status = MagicMock()
     client.post = AsyncMock(return_value=post_resp)
 
-    await _persist_codex_compaction_item(client, session_id="conv_codex")
+    await _persist_codex_compaction_item(
+        client,
+        session_id="conv_codex",
+        bridge_dir=tmp_path,
+    )
 
     client.post.assert_called_once()
     _url, kwargs = client.post.call_args
@@ -1472,8 +1722,34 @@ async def test_persist_codex_compaction_item_posts_event() -> None:
     assert body["type"] == "compaction"
     assert body["data"]["last_item_id"] == "item_codex"
     assert "Codex" in body["data"]["summary"]
-    # Codex can't read post-compaction state, so no compacted_messages
-    assert "compacted_messages" not in body["data"]
+    assert body["data"]["window_id"] == "01a070e2-2665-7d62-9b74-973decf239b7"
+    assert body["data"]["compacted_messages"][0]["role"] == "user"
+
+
+def test_compaction_persist_failure_reason_includes_server_body() -> None:
+    """A rejected compaction persist must name the server's reason.
+
+    ``raise_for_status`` reports only the status and URL, so a 400 on this POST
+    left no way to tell which field the server objected to — the payload is
+    assembled from Codex's rollout, so the answer is only in the response body.
+    """
+    request = httpx.Request("POST", "https://example.invalid/v1/sessions/conv_x/events")
+    response = httpx.Response(
+        400,
+        request=request,
+        text='{"error_code":"INVALID_PARAMETER_VALUE","message":"last_item_id not found"}',
+    )
+    exc = httpx.HTTPStatusError("400 Bad Request", request=request, response=response)
+
+    reason = fwd._compaction_persist_failure_reason(exc)
+
+    assert "400" in reason
+    assert "last_item_id not found" in reason
+
+
+def test_compaction_persist_failure_reason_handles_non_http_errors() -> None:
+    """A non-HTTP failure still gets a one-line reason rather than an empty string."""
+    assert fwd._compaction_persist_failure_reason(RuntimeError("boom")) == "RuntimeError: boom"
 
 
 @pytest.mark.asyncio
@@ -1499,8 +1775,10 @@ async def test_persist_codex_compaction_item_empty_items_fallback() -> None:
     assert "compacted_messages" not in body["data"]
 
 
+@pytest.mark.parametrize("window_id", [2, "01a070e2-2665-7d62-9b74-973decf239b7"])
 def test_read_compacted_history_extracts_replacement_history_and_window_id(
     tmp_path: Path,
+    window_id: int | str,
 ) -> None:
     """_read_compacted_history returns replacement_history and window_id."""
     import json as _json
@@ -1525,7 +1803,7 @@ def test_read_compacted_history_extracts_replacement_history_and_window_id(
                             "encrypted_content": "gAAAA_test_token",
                         },
                     ],
-                    "window_id": 2,
+                    "window_id": window_id,
                 },
             }
         ),
@@ -1535,7 +1813,7 @@ def test_read_compacted_history_extracts_replacement_history_and_window_id(
     result = fwd._read_compacted_history(rollout)
 
     assert result is not None
-    assert result["window_id"] == 2
+    assert result["window_id"] == window_id
     assert len(result["replacement_history"]) == 2
     assert result["replacement_history"][0]["type"] == "message"
     assert result["replacement_history"][0]["role"] == "user"
@@ -1952,7 +2230,7 @@ async def test_post_session_event_records_connectivity_failure_for_watchdog(
     ``_log_post_transport_failure``) so the harness idle-turn watchdog can name
     the connectivity cause instead of a generic "wedged LLM" reason.
     """
-    from omnigent import _native_forwarder_health as health
+    from omnigent.native import _native_forwarder_health as health
 
     class _AlwaysConnectError:
         """Stub client whose every POST fails to connect."""
@@ -2032,7 +2310,7 @@ async def test_mcp_startup_event_records_and_posts(tmp_path: Path) -> None:
         expected_thread_id="thread_1",
     )
 
-    from omnigent.codex_native_bridge import read_mcp_startup
+    from omnigent.harnesses.codex_native.bridge import read_mcp_startup
 
     assert read_mcp_startup(tmp_path) == {"safe": {"status": "starting", "error": None}}
     assert client.posts == [
@@ -2066,7 +2344,7 @@ async def test_mcp_startup_event_carries_failure_error(tmp_path: Path) -> None:
         expected_thread_id="thread_1",
     )
 
-    from omnigent.codex_native_bridge import read_mcp_startup
+    from omnigent.harnesses.codex_native.bridge import read_mcp_startup
 
     assert read_mcp_startup(tmp_path) == {
         "safe": {"status": "failed", "error": "handshake failed"}
@@ -2094,7 +2372,7 @@ async def test_mcp_startup_event_for_other_thread_is_ignored(tmp_path: Path) -> 
         expected_thread_id="thread_1",
     )
 
-    from omnigent.codex_native_bridge import read_mcp_startup
+    from omnigent.harnesses.codex_native.bridge import read_mcp_startup
 
     assert read_mcp_startup(tmp_path) == {}
     assert client.posts == []
@@ -2120,7 +2398,7 @@ async def test_mcp_startup_event_with_unknown_status_is_ignored(tmp_path: Path) 
         expected_thread_id="thread_1",
     )
 
-    from omnigent.codex_native_bridge import read_mcp_startup
+    from omnigent.harnesses.codex_native.bridge import read_mcp_startup
 
     assert read_mcp_startup(tmp_path) == {}
     assert client.posts == []
@@ -2149,7 +2427,7 @@ async def test_seed_mcp_startup_round_posts_config_servers(tmp_path: Path) -> No
     excluded — codex does not boot them, and a permanently-"starting"
     band entry would never resolve.
     """
-    from omnigent.codex_native_bridge import read_mcp_startup
+    from omnigent.harnesses.codex_native.bridge import read_mcp_startup
 
     client = _RecordingClient()
     _write_session_config(
@@ -2200,7 +2478,7 @@ async def test_seed_mcp_startup_round_skips_when_state_exists(tmp_path: Path) ->
     booting long ago. Only ``clear_bridge_state`` (each app-server
     launch) resets the map.
     """
-    from omnigent.codex_native_bridge import read_mcp_startup, update_mcp_server_startup
+    from omnigent.harnesses.codex_native.bridge import read_mcp_startup, update_mcp_server_startup
 
     client = _RecordingClient()
     _write_session_config(tmp_path, '[mcp_servers.safe]\ncommand = "x"\n')
@@ -2231,7 +2509,7 @@ async def test_seed_rearms_settle_timer_when_round_still_pending(
     timer must actually resolve the round: once it fires, the pending
     entries are dropped and the settled map is posted.
     """
-    from omnigent.codex_native_bridge import read_mcp_startup, update_mcp_server_startup
+    from omnigent.harnesses.codex_native.bridge import read_mcp_startup, update_mcp_server_startup
 
     client = _RecordingClient()
     update_mcp_server_startup(tmp_path, "safe", "starting")
@@ -2280,7 +2558,7 @@ async def test_thread_idle_settles_synthesized_round(tmp_path: Path) -> None:
     delivered to the thread owner) while locally-recorded ``cancelled``
     states survive, and the settled map is posted so the band clears.
     """
-    from omnigent.codex_native_bridge import read_mcp_startup, update_mcp_server_startup
+    from omnigent.harnesses.codex_native.bridge import read_mcp_startup, update_mcp_server_startup
 
     client = _RecordingClient()
     update_mcp_server_startup(tmp_path, "safe", "starting")
@@ -2322,7 +2600,7 @@ async def test_thread_active_status_does_not_settle_round(tmp_path: Path) -> Non
     happens mid-startup, before the round ends — so settling there would
     clear the band exactly when it matters most.
     """
-    from omnigent.codex_native_bridge import read_mcp_startup, update_mcp_server_startup
+    from omnigent.harnesses.codex_native.bridge import read_mcp_startup, update_mcp_server_startup
 
     client = _RecordingClient()
     update_mcp_server_startup(tmp_path, "safe", "starting")
@@ -2356,7 +2634,7 @@ async def test_model_output_item_settles_synthesized_round(tmp_path: Path) -> No
     servers" band under a visibly working agent until the turn ends or
     the config-derived window elapses.
     """
-    from omnigent.codex_native_bridge import read_mcp_startup, update_mcp_server_startup
+    from omnigent.harnesses.codex_native.bridge import read_mcp_startup, update_mcp_server_startup
 
     client = _RecordingClient()
     update_mcp_server_startup(tmp_path, "safe", "starting")
@@ -2398,7 +2676,7 @@ async def test_model_output_settles_the_round_only_once(tmp_path: Path) -> None:
     pins by re-populating the map behind the flag: a second item must
     leave it untouched.
     """
-    from omnigent.codex_native_bridge import read_mcp_startup, update_mcp_server_startup
+    from omnigent.harnesses.codex_native.bridge import read_mcp_startup, update_mcp_server_startup
 
     client = _RecordingClient()
     state = fwd._CodexForwarderState()
@@ -2448,7 +2726,7 @@ async def test_user_message_item_does_not_settle_round(tmp_path: Path) -> None:
     turn is merely ACCEPTED — which happens mid-startup — so settling on
     it would clear the band during the genuine pre-turn wait.
     """
-    from omnigent.codex_native_bridge import read_mcp_startup, update_mcp_server_startup
+    from omnigent.harnesses.codex_native.bridge import read_mcp_startup, update_mcp_server_startup
 
     client = _RecordingClient()
     update_mcp_server_startup(tmp_path, "safe", "starting")
@@ -2481,7 +2759,7 @@ async def test_other_thread_item_does_not_settle_round(tmp_path: Path) -> None:
     MCP startup is bridge-level state surfaced on the parent session;
     another thread's activity proves nothing about this round.
     """
-    from omnigent.codex_native_bridge import read_mcp_startup, update_mcp_server_startup
+    from omnigent.harnesses.codex_native.bridge import read_mcp_startup, update_mcp_server_startup
 
     client = _RecordingClient()
     update_mcp_server_startup(tmp_path, "safe", "starting")
@@ -2538,3 +2816,606 @@ def test_settle_timeout_tracks_slowest_configured_server(tmp_path: Path) -> None
         '[mcp_servers.off]\ncommand = "y"\nenabled = false\nstartup_timeout_sec = 120\n',
     )
     assert fwd._mcp_startup_settle_timeout_seconds(tmp_path) == 25.0
+
+
+def _coalescer(client: object) -> fwd._OutputTextDeltaCoalescer:
+    """Build a delta coalescer wired to ``client``."""
+    return fwd._OutputTextDeltaCoalescer(
+        client=client,
+        session_id="conv_idle",
+        flush_interval_seconds=0.05,
+        flush_char_threshold=64,
+    )
+
+
+@pytest.mark.asyncio
+async def test_delta_coalescer_close_returns_when_its_worker_is_cancelled() -> None:
+    """``close()`` must not park on a marker its cancelled worker can never resolve.
+
+    ``asyncio.run`` cancels every task before resuming any, so when the forwarder
+    resumes first its ``finally`` calls ``close()`` while the worker is cancelled but
+    not yet ``done()``. The marker is queued with nobody left to complete it.
+    """
+    coalescer = _coalescer(_RecordingClient())
+    coalescer._ensure_worker()
+    await asyncio.sleep(0)
+    worker = coalescer._worker_task
+    assert worker is not None
+
+    worker.cancel()
+    # Deliberately NOT awaited: this reproduces the teardown ordering where the
+    # worker is cancelled but has not run yet, which no `done()` check can catch.
+    assert not worker.done()
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    await asyncio.wait_for(coalescer.close(), timeout=fwd._DELTA_MARKER_TIMEOUT_SECONDS + 5.0)
+
+    assert coalescer._worker_task is None
+    assert loop.time() - started < fwd._DELTA_MARKER_TIMEOUT_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_delta_coalescer_close_gives_up_on_a_wedged_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A worker still alive but stuck mid-post must not hold ``close()`` forever.
+
+    This is the one case the bound exists for: the worker owns the marker, so it is
+    off the queue, and the worker is running, so racing it does not help either.
+    """
+
+    class _HangingClient:
+        """Client whose post never returns, wedging the worker inside a flush."""
+
+        def __init__(self) -> None:
+            self.entered = asyncio.Event()
+
+        async def post(self, *args: object, **kwargs: object) -> None:
+            self.entered.set()
+            await asyncio.sleep(3600)
+
+    monkeypatch.setattr(fwd, "_DELTA_MARKER_TIMEOUT_SECONDS", 0.1)
+    client = _HangingClient()
+    coalescer = _coalescer(client)
+    coalescer._ensure_worker()
+    coalescer._queue.put_nowait(fwd._DeltaChunk(message_id="m1", tool_call_id=None, delta="x"))
+    await asyncio.wait_for(client.entered.wait(), timeout=5.0)
+    worker = coalescer._worker_task
+    assert worker is not None
+
+    await asyncio.wait_for(coalescer.close(), timeout=fwd._DELTA_MARKER_TIMEOUT_SECONDS + 5.0)
+
+    # close() gave up on the bound rather than waiting out a worker still stuck in its post.
+    assert coalescer._worker_task is None
+    assert not worker.done()
+    worker.cancel()
+
+
+@pytest.mark.asyncio
+async def test_delta_coalescer_worker_survives_an_already_settled_marker() -> None:
+    """Resolving a marker whose future is already settled must not kill the worker.
+
+    ``set_result`` on a settled future raises ``InvalidStateError``, and
+    ``_ensure_worker`` only replaces a ``None`` task, so a worker lost this way is
+    never restarted and every later delta is dropped without a word.
+    """
+    client = _RecordingClient()
+    coalescer = _coalescer(client)
+    coalescer._ensure_worker()
+    await asyncio.sleep(0)
+
+    settled: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+    settled.cancel()
+    coalescer._queue.put_nowait(fwd._DeltaFlushBarrier(done=settled))
+    await asyncio.sleep(0.1)
+
+    assert coalescer._worker_task is not None
+    assert not coalescer._worker_task.done()
+
+    posts_before = len(client.posts)
+    coalescer._queue.put_nowait(
+        fwd._DeltaChunk(message_id="m1", tool_call_id=None, delta="still here")
+    )
+    await asyncio.wait_for(coalescer.flush(), timeout=5.0)
+    assert len(client.posts) > posts_before
+
+
+@pytest.mark.asyncio
+async def test_delta_coalescer_survives_a_cancelled_flush_caller() -> None:
+    """A cancelled ``flush()`` caller must not kill the worker.
+
+    The caller's cancellation settles its own future. Resolving it again raises
+    ``InvalidStateError`` inside the worker, and ``_ensure_worker`` only replaces a
+    ``None`` task, so the dead worker was never restarted and every later delta was
+    silently dropped.
+    """
+    client = _RecordingClient()
+    coalescer = _coalescer(client)
+    coalescer._ensure_worker()
+    await asyncio.sleep(0)
+
+    pending = asyncio.ensure_future(coalescer.flush())
+    await asyncio.sleep(0)
+    pending.cancel()
+    await asyncio.gather(pending, return_exceptions=True)
+    await asyncio.sleep(0.1)
+
+    assert coalescer._worker_task is not None
+    assert not coalescer._worker_task.done()
+
+    posts_before = len(client.posts)
+    coalescer._queue.put_nowait(
+        fwd._DeltaChunk(message_id="m1", tool_call_id=None, delta="still here")
+    )
+    await asyncio.wait_for(coalescer.flush(), timeout=5.0)
+    assert len(client.posts) > posts_before
+
+
+def test_default_collaboration_mode_refuses_when_developer_instructions_never_confirmed() -> None:
+    """No confirmed developer_instructions read yet → refuse to build a
+    payload at all, rather than risk sending an unconfirmed ``null``.
+
+    Regression for the destructive-wipe class: if every config.toml read so
+    far has been UNREADABLE, ``developer_instructions`` stays at its ``None``
+    default but ``developer_instructions_known`` stays ``False`` — this must
+    not be conflated with a confirmed ABSENT read (see the sibling test
+    above), or a Default-mode turn would serialize a literal ``null`` over a
+    value that genuinely exists but just hasn't been read successfully yet.
+    """
+    state = fwd._CodexForwarderState()
+    state.model = "gpt-5.4"
+
+    mode = fwd._default_collaboration_mode(state)
+
+    assert mode is None
+
+
+def test_default_collaboration_mode_sends_none_when_confirmed_absent() -> None:
+    """A CONFIRMED absent read → explicit ``None``, letting Codex fill in its
+    own built-in Default-mode instructions.
+
+    Distinct from the never-confirmed case below: here
+    ``developer_instructions_known`` is ``True`` (a real ABSENT read
+    happened), so the explicit ``null`` is deliberate, not a guess.
+    """
+    state = fwd._CodexForwarderState()
+    state.model = "gpt-5.4"
+    state.developer_instructions_known = True
+
+    mode = fwd._default_collaboration_mode(state)
+
+    assert mode is not None
+    assert mode["settings"]["developer_instructions"] is None
+
+
+def test_default_collaboration_mode_reuses_current_developer_instructions() -> None:
+    """A Default-mode ``turn/start`` must not silently wipe developer_instructions.
+
+    Guards a self-inflicted overwrite: a ``_default_collaboration_mode`` that
+    always sends ``developer_instructions: null`` has that null applied
+    literally by Codex's app-server, clearing whatever
+    ``build_codex_native_server`` persisted, the instant the user (or the
+    plan-implementation flow) triggers a Default-mode turn.
+    """
+    state = fwd._CodexForwarderState()
+    state.model = "gpt-5.4"
+    state.developer_instructions = "Be a concise coding assistant."
+    state.developer_instructions_known = True
+
+    mode = fwd._default_collaboration_mode(state)
+
+    assert mode is not None
+    assert mode["settings"]["developer_instructions"] == "Be a concise coding assistant."
+
+
+def test_note_thread_settings_updated_whitespace_nested_value_not_confirmed() -> None:
+    """
+    The real live ``thread/settings/updated`` fixture shape (nested under
+    ``threadSettings.collaborationMode.settings``) with a whitespace-only
+    ``developer_instructions`` must not be stored or marked confirmed.
+    """
+    state = fwd._CodexForwarderState()
+
+    state.note_thread_settings_updated(
+        {
+            "threadSettings": {
+                "model": "gpt-5.4-codex",
+                "effort": "medium",
+                "collaborationMode": {
+                    "mode": "plan",
+                    "settings": {
+                        "model": "gpt-5.4-codex",
+                        "reasoning_effort": "medium",
+                        "developer_instructions": "   ",
+                    },
+                },
+            }
+        }
+    )
+
+    assert state.developer_instructions is None
+    assert state.developer_instructions_known is False
+
+
+def test_note_developer_instructions_fields_whitespace_flat_falls_through_to_nested() -> None:
+    """
+    A whitespace-only FLAT ``developer_instructions`` must not
+    short-circuit the nested-shape check — it carries no real content, so
+    a genuine nested value (the real live ``thread/settings/updated``
+    shape) must still be found and used.
+    """
+    state = fwd._CodexForwarderState()
+
+    state._note_developer_instructions_fields(
+        {
+            "developer_instructions": "   ",
+            "collaborationMode": {
+                "settings": {"developer_instructions": "Be a concise assistant."},
+            },
+        }
+    )
+
+    assert state.developer_instructions == "Be a concise assistant."
+    assert state.developer_instructions_known is True
+
+
+def test_note_developer_instructions_fields_whitespace_flat_value_not_confirmed() -> None:
+    """
+    A whitespace-only FLAT ``developer_instructions`` in a live payload
+    must not be stored or marked confirmed — the same malformed-shape
+    class the config.toml tri-state reader treats as UNREADABLE, not
+    PRESENT. Bare truthiness is ``True`` for whitespace, which would wrongly
+    store it and mark ``developer_instructions_known``. The config.toml
+    reader guards against this; this live-notification path is a parallel
+    code path that has to guard against it independently.
+    """
+    state = fwd._CodexForwarderState()
+
+    state._note_developer_instructions_fields({"developer_instructions": "   \n\t "})
+
+    assert state.developer_instructions is None
+    assert state.developer_instructions_known is False
+
+
+def test_note_thread_settings_updated_reads_nested_developer_instructions() -> None:
+    """The real live ``thread/settings/updated`` shape nests
+    ``developer_instructions`` under ``threadSettings.collaborationMode.settings``,
+    not as a top-level ``threadSettings`` key (mirrors the fixture in
+    ``test_thread_settings_updated_records_effort_and_collaboration_mode``).
+    Regression: a flat-only lookup never updates state.developer_instructions
+    on the real live notification path.
+    """
+    state = fwd._CodexForwarderState()
+
+    state.note_thread_settings_updated(
+        {
+            "threadSettings": {
+                "model": "gpt-5.4-codex",
+                "effort": "medium",
+                "collaborationMode": {
+                    "mode": "plan",
+                    "settings": {
+                        "model": "gpt-5.4-codex",
+                        "reasoning_effort": "medium",
+                        "developer_instructions": "Be a concise assistant.",
+                    },
+                },
+            }
+        }
+    )
+
+    assert state.developer_instructions == "Be a concise assistant."
+
+
+def test_note_developer_instructions_fields_updates_from_settings_payload() -> None:
+    """A flat top-level settings payload updates developer_instructions too."""
+    state = fwd._CodexForwarderState()
+
+    state._note_developer_instructions_fields({"developer_instructions": "New instructions."})
+
+    assert state.developer_instructions == "New instructions."
+    # A live notification observing a real value is itself a confirmed
+    # read, resolving the never-yet-confirmed ambiguity independent of
+    # any config.toml read.
+    assert state.developer_instructions_known is True
+
+
+def test_read_developer_instructions_collapsed_wrapper_matches_tri_state_value(
+    tmp_path: Path,
+) -> None:
+    """The Optional[str]-returning wrapper collapses PRESENT/ABSENT/UNREADABLE
+    to their .value.
+
+    No production caller currently uses this collapsed form — both the
+    forwarder and the runner's plan-mode settings send consume
+    read_codex_config_developer_instructions_state[_from_home] directly and
+    handle all three states explicitly, because a collapsed None genuinely
+    lost information they each needed (the forwarder must actively CLEAR on
+    a confirmed ABSENT read, not just never-overwrite-on-falsy; the runner
+    must refuse/503 on UNREADABLE rather than guess). The subject here is the
+    wrapper's own remaining collapsing behavior in isolation."""
+    from omnigent.harnesses.codex_native.bridge import (
+        read_codex_config_developer_instructions_from_home,
+    )
+
+    assert read_codex_config_developer_instructions_from_home(tmp_path) is None
+    (tmp_path / "config.toml").write_text('developer_instructions = "Present value."\n')
+    assert read_codex_config_developer_instructions_from_home(tmp_path) == "Present value."
+
+
+def test_read_developer_instructions_state_unreadable_bad_encoding(tmp_path: Path) -> None:
+    """Non-UTF-8 bytes read UNREADABLE, not ABSENT — the failure this whole
+    tri-state exists to distinguish from genuine absence."""
+    from omnigent.harnesses.codex_native.bridge import (
+        DeveloperInstructionsReadState,
+        read_codex_config_developer_instructions_state_from_home,
+    )
+
+    (tmp_path / "config.toml").write_bytes(b"\xff\xfe not valid utf-8")
+    result = read_codex_config_developer_instructions_state_from_home(tmp_path)
+
+    assert result.state is DeveloperInstructionsReadState.UNREADABLE
+    assert result.value is None
+
+
+def test_read_developer_instructions_state_absent_missing_file(tmp_path: Path) -> None:
+    """A missing config.toml reads ABSENT, not UNREADABLE.
+
+    The tri-state separates "a value may be there and cannot be seen" from
+    "there is demonstrably nothing there". A missing file is the second:
+    ``_sync_codex_developer_instructions`` writes the key into this file or
+    nowhere at all, so with the file gone nothing is persisted and a caller
+    that sends no instructions overwrites nothing.
+
+    Reading it as UNREADABLE refused every plan-mode toggle on a bridge whose
+    config had not been written yet.
+    """
+    from omnigent.harnesses.codex_native.bridge import (
+        DeveloperInstructionsReadState,
+        read_codex_config_developer_instructions_state_from_home,
+    )
+
+    result = read_codex_config_developer_instructions_state_from_home(tmp_path)
+
+    assert result.state is DeveloperInstructionsReadState.ABSENT
+    assert result.value is None
+
+
+def test_read_developer_instructions_state_whitespace_only_is_unreadable(
+    tmp_path: Path,
+) -> None:
+    """A whitespace-only ``developer_instructions`` also reads UNREADABLE.
+
+    Bare truthiness (``instructions`` alone) is ``True`` for ``"   "``, which
+    would misclassify this PRESENT — the same whitespace-is-not-content
+    hazard ``AgentSpec.instructions`` has to handle. The PRESENT check must
+    use ``.strip()``, not truthiness.
+    """
+    from omnigent.harnesses.codex_native.bridge import (
+        DeveloperInstructionsReadState,
+        read_codex_config_developer_instructions_state_from_home,
+    )
+
+    (tmp_path / "config.toml").write_text('developer_instructions = "   \\n\\t "\n')
+    result = read_codex_config_developer_instructions_state_from_home(tmp_path)
+
+    assert result.state is DeveloperInstructionsReadState.UNREADABLE
+    assert result.value is None
+
+
+def test_read_developer_instructions_state_empty_string_is_unreadable(
+    tmp_path: Path,
+) -> None:
+    """An empty-string ``developer_instructions`` also reads UNREADABLE —
+    the writer never writes this shape either, so it's malformed too."""
+    from omnigent.harnesses.codex_native.bridge import (
+        DeveloperInstructionsReadState,
+        read_codex_config_developer_instructions_state_from_home,
+    )
+
+    (tmp_path / "config.toml").write_text('developer_instructions = ""\n')
+    result = read_codex_config_developer_instructions_state_from_home(tmp_path)
+
+    assert result.state is DeveloperInstructionsReadState.UNREADABLE
+    assert result.value is None
+
+
+def test_read_developer_instructions_state_malformed_shape_is_unreadable(
+    tmp_path: Path,
+) -> None:
+    """A present-but-non-string ``developer_instructions`` reads UNREADABLE,
+    not ABSENT.
+
+    ``_sync_codex_developer_instructions`` (the writer, in
+    ``codex_native_app_server.py``) only ever writes a non-empty string or
+    deletes the key outright — it never writes an empty string or a
+    non-string value. A present-but-malformed shape can only mean external
+    corruption, not a genuine "no instructions configured" state; treating
+    it as ABSENT would let a plan-mode settings send serialize
+    developer_instructions: null over a value that might still be real.
+    """
+    from omnigent.harnesses.codex_native.bridge import (
+        DeveloperInstructionsReadState,
+        read_codex_config_developer_instructions_state_from_home,
+    )
+
+    (tmp_path / "config.toml").write_text("developer_instructions = 12345\n")
+    result = read_codex_config_developer_instructions_state_from_home(tmp_path)
+
+    assert result.state is DeveloperInstructionsReadState.UNREADABLE
+    assert result.value is None
+
+
+def test_read_developer_instructions_state_absent(tmp_path: Path) -> None:
+    """A config with no top-level key reads ABSENT, distinct from unreadable."""
+    from omnigent.harnesses.codex_native.bridge import (
+        DeveloperInstructionsReadState,
+        read_codex_config_developer_instructions_state_from_home,
+    )
+
+    (tmp_path / "config.toml").write_text('[mcp_servers.fast]\ncommand = "x"\n')
+    result = read_codex_config_developer_instructions_state_from_home(tmp_path)
+
+    assert result.state is DeveloperInstructionsReadState.ABSENT
+    assert result.value is None
+
+
+def test_read_developer_instructions_state_present(tmp_path: Path) -> None:
+    """A config with the key set reads PRESENT with the value."""
+    from omnigent.harnesses.codex_native.bridge import (
+        DeveloperInstructionsRead,
+        DeveloperInstructionsReadState,
+        read_codex_config_developer_instructions_state_from_home,
+    )
+
+    (tmp_path / "config.toml").write_text(
+        'developer_instructions = "Be a concise coding assistant."\n'
+    )
+    result = read_codex_config_developer_instructions_state_from_home(tmp_path)
+
+    assert result == DeveloperInstructionsRead(
+        DeveloperInstructionsReadState.PRESENT, "Be a concise coding assistant."
+    )
+
+
+def test_refresh_developer_instructions_from_config_present_to_absent_transition(
+    tmp_path: Path,
+) -> None:
+    """A live PRESENT→ABSENT transition across two refreshes actually clears.
+
+    The forwarder must not just handle a single read correctly, but must
+    correctly transition when the underlying config changes between calls.
+    """
+    _write_session_config(tmp_path, 'developer_instructions = "Be a concise coding assistant."\n')
+    state = fwd._CodexForwarderState()
+    fwd._refresh_developer_instructions_from_config(tmp_path, state)
+    assert state.developer_instructions == "Be a concise coding assistant."
+
+    _write_session_config(tmp_path, '[mcp_servers.fast]\ncommand = "x"\n')
+    fwd._refresh_developer_instructions_from_config(tmp_path, state)
+    assert state.developer_instructions is None
+
+
+def test_refresh_developer_instructions_from_config_preserves_on_unreadable(
+    tmp_path: Path,
+) -> None:
+    """A transient/unreadable config read preserves the prior known value.
+
+    Distinct from genuine absence above: UNREADABLE means the read itself
+    failed (bad encoding here), not that the key is confirmed gone — a
+    transient glitch must never regress an already-known value to unknown.
+
+    The bad bytes go where the reader looks — the private ``CODEX_HOME``
+    under the bridge dir, as ``_write_session_config`` places a good config.
+    Written at the bridge dir itself the reader finds no file at all, which
+    is ABSENT, and the test would be asserting the absent path under an
+    unreadable name.
+    """
+    home = codex_home_for_bridge_dir(tmp_path)
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.toml").write_bytes(b"\xff\xfe not valid utf-8")
+    state = fwd._CodexForwarderState()
+    state.developer_instructions = "Prior known instructions."
+
+    fwd._refresh_developer_instructions_from_config(tmp_path, state)
+
+    assert state.developer_instructions == "Prior known instructions."
+
+
+def test_refresh_developer_instructions_from_config_clears_on_genuine_absence(
+    tmp_path: Path,
+) -> None:
+    """A config with no top-level key CLEARS a previously known value.
+
+    Genuine absence (the top-level key is genuinely gone — a real, distinct
+    tri-state result, not a collapsed truthy check) is real, actionable
+    information — e.g. the user's Omnigent-appended directive was removed —
+    and must be reflected, not preserved as stale. This is the corrected
+    expectation: a naive "no-op unless truthy" implementation cannot tell
+    genuine absence apart from a transient read failure and would keep
+    re-sending a stale value forever after a real removal.
+    """
+    _write_session_config(tmp_path, '[mcp_servers.fast]\ncommand = "x"\n')
+    state = fwd._CodexForwarderState()
+    state.developer_instructions = "Prior known instructions."
+
+    fwd._refresh_developer_instructions_from_config(tmp_path, state)
+
+    assert state.developer_instructions is None
+
+
+def test_refresh_developer_instructions_from_config_reads_current_value(
+    tmp_path: Path,
+) -> None:
+    """The forwarder's known developer_instructions comes from config.toml."""
+    _write_session_config(
+        tmp_path,
+        'developer_instructions = "Be a concise coding assistant."\n',
+    )
+    state = fwd._CodexForwarderState()
+
+    fwd._refresh_developer_instructions_from_config(tmp_path, state)
+
+    assert state.developer_instructions == "Be a concise coding assistant."
+
+
+# ---------------------------------------------------------------------------
+# _thread_started_is_ephemeral
+# ---------------------------------------------------------------------------
+
+
+def _make_thread_started(thread: dict) -> dict:
+    """Wrap a thread dict in a ``thread/started`` envelope."""
+    return {"method": "thread/started", "params": {"thread": thread}}
+
+
+def test_thread_started_is_ephemeral_true_for_ephemeral_system_thread() -> None:
+    """The exact 0.150.1 ephemeral system event is classified as ephemeral."""
+    event = _make_thread_started(
+        {
+            "id": "0195aaaa-system",
+            "ephemeral": True,
+            "path": None,
+            "threadSource": "system",
+            "source": "vscode",
+        }
+    )
+    assert fwd._thread_started_is_ephemeral(event) is True
+
+
+def test_thread_started_is_ephemeral_false_for_persistent_clear_thread() -> None:
+    """A real ``/clear`` thread (``ephemeral=false``) is not ephemeral."""
+    event = _make_thread_started(
+        {
+            "id": "0195bbbb-user-clear",
+            "ephemeral": False,
+            "path": "/rollout/0195bbbb.jsonl",
+            "threadSource": "user",
+        }
+    )
+    assert fwd._thread_started_is_ephemeral(event) is False
+
+
+def test_thread_started_is_ephemeral_false_when_ephemeral_absent() -> None:
+    """Missing ``ephemeral`` key is treated as non-ephemeral (safe default)."""
+    event = _make_thread_started({"id": "0195cccc-no-ephemeral-key"})
+    assert fwd._thread_started_is_ephemeral(event) is False
+
+
+def test_thread_started_is_ephemeral_false_for_wrong_method() -> None:
+    """Non-``thread/started`` events never count as ephemeral."""
+    event = {"method": "thread/updated", "params": {"thread": {"id": "t", "ephemeral": True}}}
+    assert fwd._thread_started_is_ephemeral(event) is False
+
+
+def test_thread_started_is_ephemeral_false_for_missing_params() -> None:
+    """Event with no params is not ephemeral."""
+    event = {"method": "thread/started"}
+    assert fwd._thread_started_is_ephemeral(event) is False
+
+
+def test_thread_started_is_ephemeral_false_for_missing_thread() -> None:
+    """Event with params but no thread is not ephemeral."""
+    event = {"method": "thread/started", "params": {}}
+    assert fwd._thread_started_is_ephemeral(event) is False

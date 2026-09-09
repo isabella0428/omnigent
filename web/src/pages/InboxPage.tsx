@@ -53,6 +53,7 @@ import { useConversations } from "@/hooks/useConversations";
 import { collectInboxItems, type InboxItem, type InboxSource } from "@/lib/inbox";
 import { relativeTime } from "@/lib/relativeTime";
 import { Link } from "@/lib/routing";
+import { useOmnigentAnalytics } from "@/lib/analytics";
 import { approve, getSession } from "@/lib/sessionsApi";
 import { userColor, userInitials } from "@/lib/userBadge";
 import { cn } from "@/lib/utils";
@@ -61,11 +62,16 @@ import { conversationDisplayLabel, getConversationAgentType } from "@/shell/side
 /** Optimistic verdicts keyed by elicitation id, mirroring the chat store's flip. */
 type RespondedMap = Record<
   string,
-  { action: "accept" | "decline"; content?: Record<string, unknown> }
+  {
+    action: "accept" | "decline";
+    content?: Record<string, unknown>;
+    _meta?: Record<string, unknown>;
+  }
 >;
 
 export function InboxPage() {
   const queryClient = useQueryClient();
+  const { trackClick } = useOmnigentAnalytics();
   const conversationsQuery = useConversations("", false, { reconcileWhileConnected: true });
   const [responded, setResponded] = useState<RespondedMap>({});
   // Manual expand/collapse toggles keyed by elicitation id. Anything
@@ -108,13 +114,7 @@ export function InboxPage() {
   const sources: InboxSource[] = [];
   rows.forEach((row, i) => {
     const snapshot = snapshotQueries[i]?.data;
-    if (snapshot) {
-      sources.push({
-        row,
-        pendingElicitations: snapshot.pendingElicitations ?? [],
-        canApprove: snapshot.canApprove ?? true,
-      });
-    }
+    if (snapshot) sources.push({ row, pendingElicitations: snapshot.pendingElicitations ?? [] });
   });
   const items = collectInboxItems(sources);
 
@@ -161,16 +161,20 @@ export function InboxPage() {
   // rollback on error. Success invalidates the session list so the row's
   // count (and the sidebar badge) drop without waiting for the socket.
   const makeSubmit = (item: InboxItem): SubmitApprovalFn => {
-    return (elicitationId, action, content) => {
+    return (elicitationId, action, content, meta) => {
       setResponded((prev) => ({
         ...prev,
-        [elicitationId]: content === undefined ? { action } : { action, content },
+        [elicitationId]: {
+          action,
+          ...(content === undefined ? {} : { content }),
+          ...(meta === undefined ? {} : { _meta: meta }),
+        },
       }));
-      void approve(
-        item.resolveSessionId,
-        elicitationId,
-        content === undefined ? { action } : { action, content },
-      ).then(
+      void approve(item.resolveSessionId, elicitationId, {
+        action,
+        ...(content === undefined ? {} : { content }),
+        ...(meta === undefined ? {} : { _meta: meta }),
+      }).then(
         () => {
           void queryClient.invalidateQueries({ queryKey: ["conversations"] });
         },
@@ -223,6 +227,7 @@ export function InboxPage() {
               failedSnapshots.forEach((q) => void q.refetch());
               commentInbox.retryFailed();
             }}
+            componentId="inbox.retry"
           >
             Retry
           </Button>
@@ -275,10 +280,11 @@ export function InboxPage() {
                 <button
                   type="button"
                   aria-expanded={expanded}
-                  onClick={() =>
-                    setExpandedOverrides((prev) => ({ ...prev, [elicitationId]: !expanded }))
-                  }
-                  className="flex min-w-0 flex-1 items-center gap-2 text-left"
+                  onClick={() => {
+                    trackClick("inbox.approval.toggle_expanded", "button");
+                    setExpandedOverrides((prev) => ({ ...prev, [elicitationId]: !expanded }));
+                  }}
+                  className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
                 >
                   <ChevronDownIcon
                     className={cn(
@@ -306,7 +312,7 @@ export function InboxPage() {
                     {relativeTime(item.row.updated_at * 1000)}
                   </span>
                   <Button asChild variant="ghost" size="sm" className="text-sm">
-                    <Link to={`/c/${item.row.id}`}>
+                    <Link to={`/c/${item.row.id}`} componentId="inbox.approval.open_session">
                       Open session
                       <ArrowRightIcon className="ml-1 size-3.5" />
                     </Link>
@@ -329,7 +335,7 @@ export function InboxPage() {
                   codexCommand={item.elicitation.codexCommand}
                   allowAllEdits={item.elicitation.allowAllEdits}
                   rememberScope={item.elicitation.rememberScope}
-                  canApprove={item.canApprove}
+                  codexPersistModes={item.elicitation.codexPersistModes}
                   onSubmit={makeSubmit(item)}
                 />
               )}
@@ -376,6 +382,7 @@ export function InboxPage() {
                           is what clears this inbox item. */}
                       <Link
                         to={`/c/${item.row.id}?file=${encodeURIComponent(comment.path)}&comment=${encodeURIComponent(comment.id)}`}
+                        componentId="inbox.comment.open_file"
                       >
                         Open file
                         <ArrowRightIcon className="ml-1 size-3.5" />

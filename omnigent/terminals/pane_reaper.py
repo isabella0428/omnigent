@@ -42,12 +42,22 @@ from typing import NamedTuple
 
 _logger = logging.getLogger(__name__)
 
+# A pane whose window emitted output this recently counts as busy. tmux's own
+# activity clock is evidence independent of the harness status pipeline, whose
+# silent stall must not get a live, producing terminal reaped. Two reaper scan
+# intervals, so any output between scans re-arms the idle clock.
+PANE_OUTPUT_BUSY_WINDOW_S = 120.0
+
 # Native CLI panes are keyed (conversation_id, <harness short name>, "main") in
 # the terminal registry. These short names match the ``terminal_name`` the
 # per-harness ``_auto_create_<harness>_terminal`` paths launch with. This is the
 # cheap name pre-filter; the wiring additionally confirms the registry resource
 # ROLE is a native harness (so a user terminal that merely shares the name is not
 # reaped — see ``create_runner_app``).
+#
+# "kimi" is deliberately absent: kimi records no resumable chat id, so a reaped
+# pane cannot be re-created with its context — the next turn would silently
+# start a fresh TUI. Keep kimi panes alive until the session is torn down.
 NATIVE_PANE_TERMINAL_NAMES: frozenset[str] = frozenset(
     {
         "claude",
@@ -57,7 +67,6 @@ NATIVE_PANE_TERMINAL_NAMES: frozenset[str] = frozenset(
         "hermes",
         "kiro",
         "qwen",
-        "kimi",
         "pi",
         "antigravity",
         "opencode",

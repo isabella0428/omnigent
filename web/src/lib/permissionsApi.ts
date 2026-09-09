@@ -14,6 +14,19 @@ import { authenticatedFetch } from "./identity";
  */
 export const LEVEL_OWNER = 4;
 
+export function workspaceSharingBlocked(workspace: string | null | undefined): boolean {
+  if (!workspace?.startsWith("/")) return false;
+
+  const parts: string[] = [];
+  for (const part of workspace.split("/")) {
+    if (part === "..") parts.pop();
+    else if (part && part !== ".") parts.push(part);
+  }
+  const prefix = workspace.startsWith("//") && !workspace.startsWith("///") ? "//" : "/";
+  const path = prefix + parts.join("/");
+  return /^(?:\/|\/root|\/(?:home|Users|var\/home)\/[^/]+)$/.test(path);
+}
+
 /**
  * Return whether a permission level denotes the session owner.
  *
@@ -29,6 +42,22 @@ export const LEVEL_OWNER = 4;
  */
 export function isOwnerLevel(level: number | null): boolean {
   return level == null || level >= LEVEL_OWNER;
+}
+
+/**
+ * Numeric permission level required to mutate the session's shared
+ * workspace. Mirrors ``LEVEL_EDIT`` in ``omnigent/server/auth.py``.
+ */
+export const LEVEL_EDIT = 2;
+
+/**
+ * Return whether a permission level grants edit access — mutating the
+ * session's shared workspace, e.g. opening or closing a shell tab (both
+ * server-gated on ``LEVEL_EDIT``). ``null`` is treated permissively
+ * (single-user / still loading), matching ``isOwnerLevel`` / ``useCanEdit``.
+ */
+export function isEditorLevel(level: number | null): boolean {
+  return level == null || level >= LEVEL_EDIT;
 }
 
 /**
@@ -95,7 +124,6 @@ export interface Permission {
   user_id: string;
   conversation_id: string;
   level: number;
-  can_approve?: boolean;
 }
 
 export async function listPermissions(sessionId: string): Promise<Permission[]> {
@@ -133,19 +161,13 @@ export async function grantPermission(
   sessionId: string,
   userId: string,
   level: number,
-  canApprove?: boolean,
 ): Promise<Permission> {
-  const body = {
-    user_id: userId,
-    level,
-    ...(canApprove === undefined ? {} : { can_approve: canApprove }),
-  };
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(sessionId)}/permissions`,
     {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
+      body: JSON.stringify({ user_id: userId, level }),
     },
   );
   if (!res.ok) {
@@ -155,6 +177,14 @@ export async function grantPermission(
   return (await res.json()) as Permission;
 }
 
+/**
+ * Remove a permission grant on a session.
+ *
+ * Passing another user's id revokes them (manage access required). Passing the
+ * caller's OWN id leaves the session — "unshare myself", so a shared session
+ * drops out of your sidebar — which the server allows with only read access.
+ * Either way it refuses to remove the owner's grant (403).
+ */
 export async function revokePermission(sessionId: string, userId: string): Promise<void> {
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(sessionId)}/permissions/${encodeURIComponent(userId)}`,

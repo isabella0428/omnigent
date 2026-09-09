@@ -49,21 +49,35 @@ from dataclasses import dataclass, field, replace
 from typing import Any, NotRequired, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse as _urlparse
 
-from omnigent import model_catalog
-from omnigent.inner.agent_env import clean_agent_env
-from omnigent.inner.native_attachments import parse_data_uri
-from omnigent.json_types import JsonObject as _JsonObject
-from omnigent.json_types import JsonValue
-from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
-from omnigent.model_metadata import ModelMetadata, ModelWireAPI
-from omnigent.onboarding.provider_config import CHAT_WIRE_API, RESPONSES_WIRE_API
-from omnigent.pi_model_compatibility import SYSTEM_AI_RESPONSES_KEYWORDS, unsupported_in_pi
-from omnigent.pi_native_credentials import (
+from omnigent.harnesses.pi_native.credentials import (
     _databricks_workspace_url_for_gateway,
     _is_databricks_ai_gateway_url,
 )
+from omnigent.inner.agent_env import clean_agent_env
+from omnigent.inner.native_attachments import parse_data_uri
+from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
+from omnigent.models import model_catalog
+from omnigent.models.model_metadata import ModelWireAPI
+from omnigent.models.pi_model_compatibility import (
+    SYSTEM_AI_RESPONSES_KEYWORDS,
+    databricks_model_aliases,
+    enrich_databricks_model_catalog,
+    pi_model_is_reasoning,
+    pi_model_json_entry,
+    unsupported_in_pi,
+)
+from omnigent.onboarding.provider_config import CHAT_WIRE_API, RESPONSES_WIRE_API
 from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
 from omnigent.spec.types import RetryPolicy
+from omnigent.util.json_types import JsonObject as _JsonObject
+from omnigent.util.json_types import JsonValue
+from omnigent.util.reasoning_effort import (
+    EFFORT_CLEAR_VALUES,
+    PI_EFFORTS,
+    nearest_pi_thinking_level,
+    to_pi_thinking_level,
+    validate_effort,
+)
 
 from ._subprocess_lifecycle import close_subprocess_transport
 from .async_utils import run_sync_on_thread
@@ -621,6 +635,21 @@ _PI_ENV_ALLOW_EXACT: frozenset[str] = frozenset(
     }
 )
 _STREAM_READ_CHUNK_SIZE = 65536
+# How long _PiRpcSession.close() waits for the Pi subprocess to exit on its own
+# after SIGTERM before falling back to SIGKILL. The interrupt-slice budget in
+# _executor_adapter must be >= this value so the slice never fires first and
+# inject a CancelledError that bypasses the SIGKILL path.
+_RPC_SESSION_CLOSE_REAP_TIMEOUT_S = 2.0
+
+# Idle budget for one stdout read during a turn. Expiry alone never ends
+# the turn (a long tool call may stay silent past it); only a real stdout
+# EOF does. Module-level so tests can patch it.
+_TURN_STDOUT_IDLE_TIMEOUT_S = 120.0
+
+# Post-error drain budget: after an errored message the only line left to
+# consume is the already-emitted ``agent_end``. Module-level so tests can
+# patch it.
+_TURN_STDOUT_ERROR_DRAIN_TIMEOUT_S = 10.0
 
 # CLI flags whose values are sensitive (e.g. the full system prompt) and must
 # not be written to logs verbatim. The value following these flags is replaced
@@ -750,9 +779,12 @@ def _build_models_json(
         wire_apis = wire_catalog.get(model_id.lower(), catalog_model.metadata.wire_apis)
         provider_name = _pi_provider_for_model(model_id, wire_apis)
         registered_model = catalog_model
-        if model is not None and model.lower() in _databricks_model_aliases(model_id):
+        if model is not None and model.lower() in databricks_model_aliases(model_id):
             registered_model = replace(catalog_model, id=model)
-        provider_models[provider_name].append(_pi_model_json_entry(registered_model))
+        # ``JsonObject`` is the open bag this builder assembles; a TypedDict is
+        # not assignable to it (dict value types are invariant), so copy.
+        entry: _JsonObject = dict(pi_model_json_entry(registered_model))
+        provider_models[provider_name].append(entry)
     config: _PiModelsConfig = {
         "providers": {
             # Models advertising Responses support use the AI Gateway's Codex
@@ -844,7 +876,7 @@ def _build_models_json(
             # over silent loss), since most current gateway models are
             # multimodal and text-only turns are unaffected.
             entry: _JsonObject = {"id": model, "input": ["text", "image"]}
-            if _pi_model_is_reasoning(model):
+            if pi_model_is_reasoning(model):
                 entry["reasoning"] = True
             provider["models"] = [*provider["models"], entry]
     return config
@@ -857,27 +889,6 @@ def _build_models_json(
 # turn dies with "Stream ended without finish_reason".
 # Note: GLM, kimi, and inkling now route via Responses API (system.ai.* ids)
 # so they no longer need this flag.
-_PI_REASONING_MODEL_FRAGMENTS: tuple[str, ...] = ("deepseek",)
-
-
-def _pi_model_is_reasoning(model: str) -> bool:
-    """Return whether *model* needs Pi's ``reasoning: true`` model flag."""
-    lower = model.lower()
-    return any(fragment in lower for fragment in _PI_REASONING_MODEL_FRAGMENTS)
-
-
-def _pi_model_json_entry(model: model_catalog.ModelEntry) -> _JsonObject:
-    """Translate normalized catalog metadata into Pi's model schema."""
-    entry: _JsonObject = {"id": model.id, "input": ["text", "image"]}
-    if model.metadata.context_window is not None:
-        entry["contextWindow"] = model.metadata.context_window
-    if model.metadata.max_output_tokens is not None:
-        entry["maxTokens"] = model.metadata.max_output_tokens
-    if _pi_model_is_reasoning(model.id):
-        entry["reasoning"] = True
-    return entry
-
-
 def _pi_needs_responses_api(
     model: str,
     wire_apis: frozenset[ModelWireAPI] | None = None,
@@ -930,78 +941,9 @@ def _databricks_model_wire_catalog(
     """Index UC wire metadata by both system and serving-endpoint aliases."""
     catalog: dict[str, frozenset[ModelWireAPI]] = {}
     for model in models:
-        for alias in _databricks_model_aliases(model.id):
+        for alias in databricks_model_aliases(model.id):
             catalog[alias] = model.metadata.wire_apis
     return catalog
-
-
-def _databricks_model_aliases(model_id: str) -> frozenset[str]:
-    """Return equivalent Unity Catalog and serving-endpoint model ids."""
-    normalized = model_id.lower()
-    aliases = {normalized}
-    if normalized.startswith("system.ai."):
-        aliases.add(f"databricks-{normalized.removeprefix('system.ai.')}")
-    elif normalized.startswith("databricks-"):
-        aliases.add(f"system.ai.{normalized.removeprefix('databricks-')}")
-    return frozenset(aliases)
-
-
-def _enrich_databricks_model_catalog(
-    discovered: Sequence[model_catalog.ModelEntry],
-    metadata_models: Sequence[model_catalog.ModelEntry],
-) -> tuple[model_catalog.ModelEntry, ...]:
-    """Add MLflow limits and capabilities to live workspace models."""
-    metadata_by_alias = {
-        alias: model.metadata
-        for model in metadata_models
-        for alias in _databricks_model_aliases(model.id)
-    }
-    enriched: list[model_catalog.ModelEntry] = []
-    for model in discovered:
-        metadata = next(
-            (
-                metadata_by_alias[alias]
-                for alias in _databricks_model_aliases(model.id)
-                if alias in metadata_by_alias
-            ),
-            None,
-        )
-        if metadata is None:
-            enriched.append(model)
-            continue
-        discovered_metadata = model.metadata
-        enriched.append(
-            replace(
-                model,
-                metadata=ModelMetadata(
-                    supported_capabilities=(
-                        discovered_metadata.supported_capabilities
-                        or metadata.supported_capabilities
-                    ),
-                    unsupported_capabilities=(
-                        discovered_metadata.unsupported_capabilities
-                        or metadata.unsupported_capabilities
-                    ),
-                    context_window=(
-                        discovered_metadata.context_window
-                        if discovered_metadata.context_window is not None
-                        else metadata.context_window
-                    ),
-                    max_output_tokens=(
-                        discovered_metadata.max_output_tokens
-                        if discovered_metadata.max_output_tokens is not None
-                        else metadata.max_output_tokens
-                    ),
-                    cost_tier=(
-                        discovered_metadata.cost_tier
-                        if discovered_metadata.cost_tier is not None
-                        else metadata.cost_tier
-                    ),
-                    wire_apis=discovered_metadata.wire_apis or metadata.wire_apis,
-                ),
-            )
-        )
-    return tuple(enriched)
 
 
 async def _create_subprocess_exec(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:  # type: ignore[explicit-any]
@@ -1074,6 +1016,7 @@ class _PiRpcSession:
         cwd: str | None = None,
         model: str | None = None,
         system_prompt: str | None = None,
+        thinking: str | None = None,
         extra_args: list[str] | None = None,
     ) -> None:
         """
@@ -1093,6 +1036,9 @@ class _PiRpcSession:
             ``None`` lets Pi pick its default.
         :param system_prompt: Text appended to Pi's default system
             prompt via ``--append-system-prompt``. ``None`` skips it.
+        :param thinking: Pi thinking level in Pi's own vocabulary
+            (``off``/``minimal``/.../``max``), passed as ``--thinking``.
+            ``None`` omits the flag so Pi's model default applies.
         :param extra_args: Extra CLI tokens (``--extension``,
             ``--tools``, ...). ``None`` appends nothing.
         """
@@ -1107,6 +1053,8 @@ class _PiRpcSession:
                     else model,
                 ]
             )
+        if thinking:
+            args.extend(["--thinking", thinking])
         if system_prompt:
             # Use --append-system-prompt instead of --system-prompt so Pi
             # keeps its default prompt (which includes tool descriptions from
@@ -1188,12 +1136,69 @@ class _PiRpcSession:
         self.process.stdin.write(line.encode("utf-8"))
         await self.process.stdin.drain()
 
-    async def read_line(self, timeout: float = 120.0) -> str | None:
-        """Read the next JSONL line from Pi's stdout. Returns None on EOF."""
+    async def request(
+        self,
+        command: CodexEvent,
+        expected: str,
+        *,
+        timeout: float = 15.0,
+    ) -> CodexEvent | None:
+        """Send *command* and return its ``response`` line's payload.
+
+        Only safe between turns: lines that arrive before the response are
+        re-queued in order, but a caller reading them concurrently would race.
+
+        :param command: The RPC command to send; must carry an ``id``.
+        :param expected: The ``command`` value the response must name.
+        :returns: The response event, or ``None`` on EOF/timeout/failure.
+        """
+        await self.send_command(command)
+        deferred: list[str] = []
+        result: CodexEvent | None = None
+        try:
+            while True:
+                line = await self.read_line(timeout=timeout)
+                if line is None:
+                    break
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if (
+                    isinstance(event, dict)
+                    and event.get("type") == "response"
+                    and event.get("command") == expected
+                ):
+                    result = event if event.get("success", True) else None
+                    break
+                deferred.append(line)
+        finally:
+            for line in deferred:
+                self._line_queue.put_nowait(line)
+        return result
+
+    async def read_line(self, timeout: float = _TURN_STDOUT_IDLE_TIMEOUT_S) -> str | None:
+        """Read the next JSONL line from Pi's stdout.
+
+        Returns ``None`` on EOF **or** timeout; callers that must tell
+        the two apart check :meth:`stdout_at_eof`.
+        """
         try:
             return await asyncio.wait_for(self._line_queue.get(), timeout=timeout)
         except asyncio.TimeoutError:
             return None
+
+    def stdout_at_eof(self) -> bool:
+        """Whether Pi's stdout is exhausted (process exited / pipe closed).
+
+        The background reader runs until EOF and pushes the ``None``
+        sentinel from its ``finally``, so a finished (or never-started)
+        reader means no further stdout lines can arrive, while a live
+        reader means a ``read_line`` ``None`` was only an idle timeout.
+        Also requires an empty queue so already-buffered lines are
+        drained before the stream is declared exhausted.
+        """
+        return (self._read_task is None or self._read_task.done()) and self._line_queue.empty()
 
     async def close(self) -> None:
         for task in (self._read_task, self._stderr_task):
@@ -1207,7 +1212,9 @@ class _PiRpcSession:
             with contextlib.suppress(ProcessLookupError):
                 self.process.terminate()
             try:
-                await asyncio.wait_for(self.process.wait(), timeout=2.0)
+                await asyncio.wait_for(
+                    self.process.wait(), timeout=_RPC_SESSION_CLOSE_REAP_TIMEOUT_S
+                )
             except (asyncio.TimeoutError, ProcessLookupError, RuntimeError):
                 # RuntimeError can happen when the subprocess was created on a
                 # different event loop (e.g. test fixtures that call close() in
@@ -1231,6 +1238,9 @@ class _PiSessionState:
     rpc: _PiRpcSession | None = None
     system_prompt: str | None = None
     model: str | None = None
+    # Thinking level (Pi vocabulary) this process is known to be running at,
+    # so an unchanged effort costs no RPC and a changed one is applied live.
+    applied_thinking: str | None = None
     _has_sent_prompt: bool = False
 
 
@@ -1678,6 +1688,26 @@ def _aggregate_pi_turn_usage(
     }
 
 
+def _pi_thinking_from_config(config: ExecutorConfig | None) -> str | None:
+    """Resolve the per-turn ``--thinking``/RPC level from a turn's config.
+
+    Canonical omnigent efforts (:data:`PI_EFFORTS`) are translated to Pi's
+    vocabulary; a clear value (``default``/``off``/``reset``) resolves to
+    ``None``, which leaves a live session at its current level and omits
+    ``--thinking`` on the next spawn so Pi's model default applies.
+
+    :param config: The turn's executor config, or ``None``.
+    :returns: A Pi thinking level, or ``None`` when no effort is requested.
+    :raises ValueError: If the requested effort is not one Pi supports.
+    """
+    cfg = config or ExecutorConfig()
+    raw = cfg.extra.get("reasoning_effort")
+    if isinstance(raw, str) and raw in EFFORT_CLEAR_VALUES:
+        return None
+    effort = validate_effort(raw, "pi", PI_EFFORTS)
+    return to_pi_thinking_level(effort) if effort is not None else None
+
+
 class PiExecutor(Executor):
     """Execute agent turns via the Pi coding agent (``pi --mode rpc``)."""
 
@@ -1744,7 +1774,7 @@ class PiExecutor(Executor):
             budget. ``None`` resolves to ``RetryPolicy()`` defaults.
             See Phase 1f of ``designs/RETRY_ACROSS_HARNESSES.md``.
         :param bundle_dir: The agent bundle's extracted on-disk path.
-            When set, ``<bundle_dir>/skills/<name>/SKILL.md`` files
+            When set, ``<bundle_dir>/skills/<dir>/SKILL.md`` files
             are exposed to Pi via ``--skill <path>`` based on
             *skills_filter*. ``None`` skips bundle-skill wiring.
         :param agent_name: Optional agent display name. Reserved for
@@ -1797,7 +1827,7 @@ class PiExecutor(Executor):
         # off (they don't route through Omnigent policies / history and
         # can 400 against the Databricks Responses API), and the bridge
         # extension's tools are explicitly allowlisted.
-        from omnigent.pi_native import pi_supports_approve
+        from omnigent.harnesses.pi_native.main import pi_supports_approve
 
         self._extra_args: list[str] = ["--no-tools"]
         if pi_supports_approve(self._pi_path):
@@ -1982,12 +2012,14 @@ class PiExecutor(Executor):
         cfg = config or ExecutorConfig()
         model = cfg.model or self._model_override
         if model is None and self._gateway_uses_databricks_profile:
-            resolution = await run_sync_on_thread(
-                model_catalog.resolve_catalog_model,
-                "databricks",
-                family="claude",
+            # DATABRICKS-PATCH(pi-live-model-discovery): resolve from the
+            # workspace, not the bundled catalog whose legacy `databricks-` ids
+            # the gateway answers with `501 … Use Unity Catalog model services`.
+            from omnigent.inner.claude_sdk_executor import _resolve_databricks_claude_model
+
+            model_id = await run_sync_on_thread(
+                _resolve_databricks_claude_model, self._databricks_profile
             )
-            model_id = resolution.model_id
             if not isinstance(model_id, str):
                 raise TypeError("Databricks model resolution returned a non-string model id")
             return model_id
@@ -2063,7 +2095,7 @@ class PiExecutor(Executor):
                 exc_info=True,
             )
         else:
-            models = _enrich_databricks_model_catalog(models, metadata_models)
+            models = enrich_databricks_model_catalog(models, metadata_models)
         self._gateway_model_entries = tuple(models)
         self._gateway_model_wire_apis = _databricks_model_wire_catalog(models)
         return self._gateway_model_wire_apis
@@ -2227,14 +2259,83 @@ class PiExecutor(Executor):
 
         return PiSubprocessConfig(env=env, tmp_dir=tmp_dir, extra_args=extra_args)
 
+    async def _available_thinking_levels(self, rpc: _PiRpcSession) -> list[str] | None:
+        """Ask Pi which thinking levels the current model offers.
+
+        :returns: The reported levels, or ``None`` when Pi did not answer (an
+            older build, a busy stream) — the caller then skips clamping.
+        """
+        try:
+            response = await rpc.request(
+                {"type": "get_available_thinking_levels", "id": "thinking_levels"},
+                "get_available_thinking_levels",
+            )
+        except Exception:  # noqa: BLE001 — a probe failure must not sink the turn
+            logger.debug("PiExecutor: get_available_thinking_levels failed", exc_info=True)
+            return None
+        data = response.get("data") if response else None
+        levels = data.get("levels") if isinstance(data, dict) else None
+        if not isinstance(levels, list):
+            return None
+        return [level for level in levels if isinstance(level, str)]
+
+    async def _apply_thinking_level(
+        self,
+        state: _PiSessionState,
+        rpc: _PiRpcSession,
+        thinking: str | None,
+        *,
+        spawned: bool,
+    ) -> None:
+        """Make the live Pi session run at *thinking*, clamping if unsupported.
+
+        A fresh spawn already carries the level on its argv, so it only needs
+        an RPC when the model doesn't offer that rung; a live session gets
+        ``set_thinking_level`` whenever the requested level changed.
+
+        :param state: Session state whose ``applied_thinking`` is updated.
+        :param rpc: The live Pi RPC session.
+        :param thinking: Requested level in Pi vocabulary, or ``None`` to leave
+            the session alone (clear-to-default is a no-op mid-session).
+        :param spawned: ``True`` when *rpc* was just spawned with ``--thinking``.
+        """
+        if thinking is None:
+            return
+        if not spawned and thinking == state.applied_thinking:
+            return
+        supported = await self._available_thinking_levels(rpc)
+        level = nearest_pi_thinking_level(thinking, supported) if supported else None
+        if level is None:
+            level = thinking
+        if level != thinking:
+            logger.warning(
+                "PiExecutor: model %s does not support thinking level %r; using %r",
+                state.model,
+                thinking,
+                level,
+            )
+        elif spawned:
+            return
+        await rpc.send_command(
+            {"type": "set_thinking_level", "level": level, "id": f"thinking_{level}"}
+        )
+        state.applied_thinking = thinking
+
     async def _ensure_rpc(
         self,
         session_key: str,
         system_prompt: str,
         model: str | None,
         tools: list[ToolSpec],
+        thinking: str | None = None,
     ) -> _PiRpcSession:
-        """Get or create a Pi RPC subprocess for the given session."""
+        """Get or create a Pi RPC subprocess for the given session.
+
+        :param thinking: Pi thinking level for a fresh spawn (``--thinking``).
+            A change on a live process is applied over RPC instead — see
+            :meth:`_apply_thinking_level` — so it is not part of the reuse
+            signature. A model change respawns, which re-asserts the level.
+        """
         state = self._session_states.setdefault(session_key, _PiSessionState())
 
         effective_model = model
@@ -2284,11 +2385,13 @@ class PiExecutor(Executor):
             cwd=self._cwd,
             model=pi_model or None,
             system_prompt=system_prompt or None,
+            thinking=thinking,
             extra_args=extra_args or None,
         )
         state.rpc = rpc
         state.system_prompt = system_prompt
         state.model = effective_model
+        state.applied_thinking = thinking
         state._has_sent_prompt = False
         return rpc
 
@@ -2311,12 +2414,27 @@ class PiExecutor(Executor):
                     self._databricks_token = token
         session_key = self._session_key(messages)
         model = await self._resolve_model(config)
-
         try:
-            rpc = await self._ensure_rpc(session_key, system_prompt, model, tools)
+            thinking = _pi_thinking_from_config(config)
+        except ValueError as exc:
+            yield ExecutorError(message=str(exc), retryable=False)
+            return
+
+        prior_rpc = (self._session_states.get(session_key) or _PiSessionState()).rpc
+        try:
+            rpc = await self._ensure_rpc(session_key, system_prompt, model, tools, thinking)
         except Exception as exc:  # noqa: BLE001 — executor boundary surfaces startup errors as ExecutorError
             yield ExecutorError(message=f"Failed to start Pi: {exc}")
             return
+
+        turn_state = self._session_states.get(session_key)
+        if turn_state is not None:
+            try:
+                await self._apply_thinking_level(
+                    turn_state, rpc, thinking, spawned=rpc is not prior_rpc
+                )
+            except Exception as exc:  # noqa: BLE001 — executor boundary: an effort failure must not sink the turn
+                logger.warning("PiExecutor: could not apply thinking level: %s", exc)
 
         # Build the prompt to send to Pi.  On the first turn of a new Pi
         # process, if there are prior messages (e.g. parent history passed
@@ -2352,7 +2470,15 @@ class PiExecutor(Executor):
         else:
             message = prompt
         cmd_id = f"turn_{id(messages)}"
-        command: CodexEvent = {"type": "prompt", "message": message, "id": cmd_id}
+        # streamingBehavior='followUp' lets Pi queue the prompt when its isStreaming
+        # flag is still set after a race with a not-yet-confirmed-dead subprocess,
+        # rather than surfacing the raw 'Agent is already processing' protocol error.
+        command: CodexEvent = {
+            "type": "prompt",
+            "message": message,
+            "id": cmd_id,
+            "streamingBehavior": "followUp",
+        }
         if images:
             command["images"] = images
         try:
@@ -2377,8 +2503,20 @@ class PiExecutor(Executor):
         while True:
             # After an errored message the only thing left to drain is the
             # already-emitted agent_end, so don't wait the full idle budget.
-            line = await rpc.read_line(timeout=120.0 if pending_error is None else 10.0)
+            line = await rpc.read_line(
+                timeout=_TURN_STDOUT_IDLE_TIMEOUT_S
+                if pending_error is None
+                else _TURN_STDOUT_ERROR_DRAIN_TIMEOUT_S
+            )
             if line is None:
+                if pending_error is None and not rpc.stdout_at_eof():
+                    # Idle timeout, not process death: pi's stdout reader is
+                    # still running — e.g. a long tool call silent past the
+                    # idle budget. Keep waiting; a dead pi process delivers
+                    # a real EOF (reader finishes) instead. True hangs are
+                    # bounded by the harness-level idle watchdog.
+                    logger.debug("PiExecutor: stdout idle past budget; pi still running, waiting")
+                    continue
                 if pending_error is not None:
                     yield ExecutorError(message=pending_error)
                 elif not streamed_any and not response_text:

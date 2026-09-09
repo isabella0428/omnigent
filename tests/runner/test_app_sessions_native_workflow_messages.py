@@ -12,15 +12,12 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from omnigent import (
-    claude_native_bridge,
-)
 from omnigent.entities.session_resources import SessionResourceView
+from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.runner import create_runner_app
 from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
 )
-from omnigent.runtime.prompt import SHARED_SESSION_AUTHORSHIP_INSTRUCTION
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from tests.runner.conftest import (
     _BlockingHarnessClient,
@@ -273,17 +270,14 @@ async def test_post_turn_continuation() -> None:
     """Buffered messages are drained and sent to the harness after the first turn."""
     import asyncio as _aio
 
-    from omnigent.runner.app import _session_histories_ref
-
     gate = _aio.Event()
     app, _pm, hc = _build_blocking_app(gate)
-    session_id = "68d532c6117d7c15ec58a38e9c7f4790"
 
     async with _runner_client(app) as client:
         await client.post(
             "/v1/sessions",
             json={
-                "session_id": session_id,
+                "session_id": "68d532c6117d7c15ec58a38e9c7f4790",
                 "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
             },
         )
@@ -298,7 +292,6 @@ async def test_post_turn_continuation() -> None:
                     "model": "test-agent",
                     "content": [{"type": "input_text", "text": "first"}],
                     "harness": "openai-agents",
-                    "created_by": "alice@example.com",
                 },
             )
             async for _ in resp.aiter_text():
@@ -316,8 +309,6 @@ async def test_post_turn_continuation() -> None:
                 "model": "test-agent",
                 "content": [{"type": "input_text", "text": "second"}],
                 "harness": "openai-agents",
-                "created_by": "bob@example.com",
-                "author_attribution_required": True,
             },
         )
         assert resp2.status_code == 202
@@ -337,15 +328,6 @@ async def test_post_turn_continuation() -> None:
         f"Expected harness to receive 2 messages (initial + "
         f"continuation), got {len(hc.posted_bodies)}"
     )
-    continuation = hc.posted_bodies[-1]
-    assert _body_contains_text(continuation, "[alice@example.com]: first")
-    assert _body_contains_text(continuation, "[bob@example.com]: second")
-    assert SHARED_SESSION_AUTHORSHIP_INSTRUCTION in continuation["instructions"]
-    assert "created_by" not in json.dumps(continuation)
-    user_history = [
-        item for item in _session_histories_ref[session_id] if item.get("role") == "user"
-    ]
-    assert user_history[-1]["created_by"] == "bob@example.com"
 
 
 def _body_contains_text(body: dict[str, Any], needle: str) -> bool:
@@ -889,6 +871,82 @@ async def test_forwarded_model_override_reaches_the_harness() -> None:
 
 
 @pytest.mark.asyncio
+async def test_forwarded_reasoning_effort_reaches_the_harness() -> None:
+    """The turn's reasoning effort rides the forwarded message to the harness.
+
+    ``_run_turn_bg`` builds the harness body field by field, so an effort that
+    is not threaded never becomes ``ExecutorConfig.extra["reasoning_effort"]``
+    and in-process harnesses (pi among them) run at the model default while the
+    session row claims otherwise — the background-turn half of #3536. The
+    server-side half (sending the persisted effort per event) stays with that
+    issue; here an in-band value and a prior ``effort_change`` are threaded.
+    """
+    hc = _ScriptedHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+            _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+        ]
+    )
+    pm = _FakeProcessManager(hc)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    session = "ee1f2b3c4d5e6f708192a3b4c5d6e7f8"
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            f"/v1/sessions/{session}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "model": "test-agent",
+                "content": [{"type": "input_text", "text": "hi"}],
+                "harness": "pi",
+                "reasoning": {"effort": "high"},
+            },
+        )
+        assert resp.status_code == 202
+        for _ in range(200):
+            if hc.posted_bodies:
+                break
+            await asyncio.sleep(0.01)
+
+        assert hc.posted_bodies, "harness never received a turn"
+        assert hc.posted_bodies[0].get("reasoning") == {"effort": "high"}, (
+            "the effort was dropped between the runner's message intake and the "
+            f"harness body: {hc.posted_bodies[0].keys()}"
+        )
+
+        # A mid-session /effort change is remembered, so the next turn carries
+        # it without the client repeating it in-band.
+        effort_resp = await client.post(
+            f"/v1/sessions/{session}/events",
+            json={"type": "effort_change", "effort": "low"},
+        )
+        assert effort_resp.status_code == 204
+        hc.posted_bodies.clear()
+        resp = await client.post(
+            f"/v1/sessions/{session}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "model": "test-agent",
+                "content": [{"type": "input_text", "text": "again"}],
+                "harness": "pi",
+            },
+        )
+        assert resp.status_code == 202
+        for _ in range(200):
+            if hc.posted_bodies:
+                break
+            await asyncio.sleep(0.01)
+
+    assert hc.posted_bodies, "harness never received the second turn"
+    assert hc.posted_bodies[0].get("reasoning") == {"effort": "low"}
+
+
+@pytest.mark.asyncio
 async def test_buffered_continuation_skips_transient_idle() -> None:
     """End-of-turn `idle` is suppressed when a buffered message will start a new turn."""
     import asyncio as _aio
@@ -1215,83 +1273,6 @@ async def test_session_creation_auto_starts_turn_for_unanswered_user_message() -
         "from history. Empty content means _load_history_as_input "
         "failed or _session_histories wasn't populated."
     )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("flag_value", "owner_text", "collaborator_text", "has_instruction"),
-    [
-        (
-            None,
-            "[alice@example.com]: owner request",
-            "[bob@example.com]: collaborator request",
-            True,
-        ),
-        ("0", "owner request", "collaborator request", False),
-    ],
-)
-async def test_cold_loaded_shared_history_respects_attribution_flag(
-    monkeypatch: pytest.MonkeyPatch,
-    flag_value: str | None,
-    owner_text: str,
-    collaborator_text: str,
-    has_instruction: bool,
-) -> None:
-    """A restarted runner keeps shared labels and instructions in sync."""
-    import asyncio as _aio
-
-    env_name = "OMNIGENT_SHARED_MESSAGE_ATTRIBUTION_ENABLED"
-    if flag_value is None:
-        monkeypatch.delenv(env_name, raising=False)
-    else:
-        monkeypatch.setenv(env_name, flag_value)
-
-    history = [
-        {
-            "id": "shared_item_1",
-            "type": "message",
-            "role": "user",
-            "created_by": "alice@example.com",
-            "content": [{"type": "input_text", "text": "owner request"}],
-        },
-        {
-            "id": "shared_item_2",
-            "type": "message",
-            "role": "assistant",
-            "content": [{"type": "output_text", "text": "working"}],
-        },
-        {
-            "id": "shared_item_3",
-            "type": "message",
-            "role": "user",
-            "created_by": "bob@example.com",
-            "content": [{"type": "input_text", "text": "collaborator request"}],
-        },
-    ]
-    app, _pm, hc = _build_recovery_app(history)
-
-    async with _runner_client(app) as client:
-        resp = await client.post(
-            "/v1/sessions",
-            json={
-                "session_id": (
-                    "6c98a4e7ae5547a9a8f5e6400ff3c8bd"
-                    if flag_value is None
-                    else "1da9be476f4b49b09561d7deafdc07d8"
-                ),
-                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
-            },
-        )
-        assert resp.status_code == 201
-        await _aio.sleep(0.5)
-
-    assert len(hc.posted_bodies) == 1
-    body = hc.posted_bodies[0]
-    assert _ordered_user_texts(body) == [owner_text, collaborator_text]
-    instruction_present = (
-        "unprefixed messages; their authorship is unknown" in body["instructions"]
-    )
-    assert instruction_present is has_instruction
 
 
 @pytest.mark.asyncio
@@ -2151,7 +2132,14 @@ def _build_fwd_blocking_app(
     :param fwd_gate: Releases a blocked interrupt forward.
     :returns: ``(app, process_manager, harness_client)`` tuple.
     """
-    spec = AgentSpec(spec_version=1, name="t")
+    # Use the test-only harness so _build_spawn_env_from_spec returns None
+    # without reading provider config. The test seeds _session_spec_cache via
+    # POST /v1/sessions before sending the turn.
+    spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "runner-test-default"}),
+    )
     sse_frames = [
         _sse({"type": "response.created", "response": {"id": "resp_fwd"}}),
         _sse({"type": "response.completed", "response": {"id": "resp_fwd"}}),
@@ -2194,6 +2182,11 @@ async def test_interrupt_forwards_to_harness_before_cancelling() -> None:
 
     async with _runner_client(app) as client:
         conv_id = "d741917a64f51f2d41226b88d53daf58"
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_fwd_test"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
         resp = await client.post(
             f"/v1/sessions/{conv_id}/events",
             json={
