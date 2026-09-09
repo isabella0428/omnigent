@@ -100,6 +100,14 @@ class ClaudeNativeExecutor(Executor):
         text = _content_to_text(content, self._bridge_dir)
         if not text:
             return False
+        if is_auth_slash_command(text):
+            # Same dead end as in run_turn(): /login and /logout must
+            # never be typed into the pane. Refusing the live injection
+            # keeps the runner's buffered copy (no injection.consumed is
+            # emitted), so the message re-arrives as the next turn and
+            # run_turn's short-circuit answers it with the `omni setup`
+            # guidance instead of spending a model turn on it.
+            return False
         try:
             async with self._inject_lock:
                 await asyncio.to_thread(

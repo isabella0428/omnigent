@@ -7020,7 +7020,9 @@ _CONTEXT_OVERFLOW_REPLACEMENT = (
 #
 # The lookbehind keeps paths and URLs out (``a/login``, ``//login``,
 # ``https://host/login``); ``\b`` keeps ``/loginfoo`` out while still
-# matching ``/login.`` and ``/login,``.
+# matching ``/login.`` and ``/login,``. A token-initial ``/login/...``
+# still matches — acceptable, because only flagged CLI-authored
+# constants ever reach this check.
 #
 # ``/logout`` is deliberately NOT matched. The CLI has auth errors that
 # name it alone — "· unset it or /logout to clear the saved key",
